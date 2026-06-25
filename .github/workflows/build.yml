@@ -1,0 +1,158 @@
+# =============================================================================
+# build.yml  —  lives in the PUBLIC repo:  codeman9528/QuasarAPP-build
+# Copy this file to that repo at  .github/workflows/build.yml
+#
+# Heavy, free compile of a branded Quasar client. NO real signing key here:
+# we build updater artifacts with a throwaway ephemeral key (its .sig is
+# discarded), upload the unsigned artifacts to R2 staging, then hand off to the
+# private repo's sign.yml which re-signs with the real L3 key.
+#
+# See docs/build-farm/DESIGN.md + docs/adr/013-branded-build-release-pipeline.md
+#
+# NOTE: pin every third-party action to a commit SHA before production
+#       (shown here with version tags for readability).
+# =============================================================================
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:      { description: "brand slug (brands/<slug>/brand.yaml must exist in the private repo)", required: true }
+      version:   { description: "release version, e.g. 1.4.2", required: true }
+      build_id:  { description: "orchestrator build id (echoed back in the dispatch)", required: true }
+
+concurrency:
+  group: build-${{ inputs.slug }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  # Operator-wide PUBLIC keys — repo *variables*, not secrets (pubkeys aren't secret).
+  QUASAR_UI_PUBKEY:      ${{ vars.QUASAR_UI_PUBKEY }}
+  QUASAR_KERNEL_PUBKEY:  ${{ vars.QUASAR_KERNEL_PUBKEY }}
+  TAURI_UPDATER_PUBKEY:  ${{ vars.TAURI_UPDATER_PUBKEY }}
+  # R2 staging endpoint + WRITE-ONLY-to-staging token (leak = throwaway bucket only).
+  R2_ENDPOINT:           ${{ vars.R2_ENDPOINT }}            # https://<acct>.r2.cloudflarestorage.com
+  AWS_ACCESS_KEY_ID:     ${{ secrets.R2_STAGING_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_STAGING_SECRET }}
+  AWS_DEFAULT_REGION:    auto
+  STAGING_BUCKET:        ${{ vars.STAGING_BUCKET }}         # e.g. quasar-staging
+
+jobs:
+  compile:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-latest,  arch: linux-x86_64   }
+          - { os: windows-latest, arch: windows-x86_64 }
+          - { os: macos-14,       arch: darwin-aarch64 }
+          # add { os: macos-13, arch: darwin-x86_64 } for Intel macs
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout PRIVATE source (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: codeman9528/QuasarAPP
+          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+
+      - name: Linux build deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf build-essential file
+
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.12.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.1" --locked
+
+      - name: Build UI bundle
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -C apps/ui build
+
+      - name: Apply brand (patches tauri.conf.json + icons + .cargo env)
+        run: cargo run -p quasar-builder -- apply --brand "brands/${{ inputs.slug }}/brand.yaml"
+
+      - name: Regenerate icon set from brand icon.png (if the console uploaded one)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "brands/${{ inputs.slug }}/icon.png" ]; then
+            echo "branding app icon from brands/${{ inputs.slug }}/icon.png"
+            cargo tauri icon "brands/${{ inputs.slug }}/icon.png" -o crates/tauri-app/icons
+          else
+            echo "no brand icon.png — using repo default icons"
+          fi
+
+      - name: Generate EPHEMERAL signing key (discarded; real key is in sign.yml)
+        shell: bash
+        run: |
+          cargo tauri signer generate -w "$RUNNER_TEMP/eph.key" -p "" >/dev/null 2>&1
+          echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/eph.key")" >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
+
+      - name: Build app (installers + updater archives)
+        run: cargo tauri build
+
+      - name: Collect updater archive + installer
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="target/release/bundle"
+          case "${{ matrix.arch }}" in
+            linux-*)
+              up=$(ls "$base"/appimage/*.AppImage.tar.gz)
+              inst=$(ls "$base"/appimage/*.AppImage 2>/dev/null | head -1 || true) ;;
+            windows-*)
+              up=$(ls "$base"/nsis/*-setup.nsis.zip)
+              inst=$(ls "$base"/nsis/*-setup.exe 2>/dev/null | head -1 || true) ;;
+            darwin-*)
+              up=$(ls "$base"/macos/*.app.tar.gz)
+              inst=$(ls "$base"/dmg/*.dmg 2>/dev/null | head -1 || true) ;;
+          esac
+          echo "updater=$up" >> "$GITHUB_OUTPUT"
+          echo "updater_name=$(basename "$up")" >> "$GITHUB_OUTPUT"
+          echo "installer=$inst" >> "$GITHUB_OUTPUT"
+          echo "installer_name=$([ -n "$inst" ] && basename "$inst" || echo '')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload UNSIGNED updater + installer to R2 staging
+        shell: bash
+        run: |
+          set -euo pipefail
+          bid="${{ inputs.build_id }}"; arch="${{ matrix.arch }}"
+          # Updater archive (sign.yml re-signs it). We do NOT upload the
+          # ephemeral .sig — sign.yml produces the real one.
+          aws s3 cp --endpoint-url "$R2_ENDPOINT" "${{ steps.collect.outputs.updater }}" \
+            "s3://$STAGING_BUCKET/$bid/updater/$arch/${{ steps.collect.outputs.updater_name }}"
+          # Installer (direct download; not Tauri-signed).
+          if [ -n "${{ steps.collect.outputs.installer_name }}" ]; then
+            aws s3 cp --endpoint-url "$R2_ENDPOINT" "${{ steps.collect.outputs.installer }}" \
+              "s3://$STAGING_BUCKET/$bid/installer/$arch/${{ steps.collect.outputs.installer_name }}"
+          else
+            echo "no installer bundle for $arch (check tauri.conf bundle targets)"
+          fi
+
+  handoff:
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch private sign.yml
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PRIVATE_DISPATCH_TOKEN }}   # fine-grained PAT: dispatch on codeman9528/QuasarAPP
+          repository: codeman9528/QuasarAPP
+          event-type: brand-build-signed
+          client-payload: |
+            {
+              "build_id": "${{ inputs.build_id }}",
+              "slug": "${{ inputs.slug }}",
+              "version": "${{ inputs.version }}"
+            }
