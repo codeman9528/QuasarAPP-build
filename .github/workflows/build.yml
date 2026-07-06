@@ -98,6 +98,11 @@ jobs:
           echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/eph.key")" >> "$GITHUB_ENV"
           echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
 
+      - name: Fetch geo databases (bundled so the client loads geoip locally,
+              not from GitHub at runtime — blocked behind the GFW; ADR-014 §6)
+        shell: bash
+        run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo
+
       - name: Build app (installers + updater archives)
         run: cargo tauri build
 
