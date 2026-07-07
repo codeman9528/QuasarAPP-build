@@ -103,6 +103,11 @@ jobs:
         shell: bash
         run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo
 
+      - name: Fetch kernel binaries (bundled so a fresh install works offline —
+              no first-run OTA download; OTA handles later upgrades)
+        shell: bash
+        run: bash scripts/fetch-kernels.sh crates/tauri-app/resources/kernels
+
       - name: Build app (installers + updater archives)
         run: cargo tauri build
 
