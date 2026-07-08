@@ -55,6 +55,19 @@ jobs:
           repository: codeman9528/QuasarAPP
           ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
 
+      # Builds float to main HEAD (no per-build ref pin), so record the exact
+      # commit that produced this artifact — provenance + reproducibility. Shows
+      # in the run summary and is exported for later steps / debugging.
+      - name: Record source commit
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "· built ${{ inputs.slug }} v${{ inputs.version }} from private@$sha" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Linux build deps
         if: matrix.os == 'ubuntu-latest'
         run: |
