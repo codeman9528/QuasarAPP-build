@@ -1,0 +1,117 @@
+# =============================================================================
+# build-android.yml  —  lives in the PUBLIC repo:  codeman9528/QuasarAPP-build
+# Copy to that repo at  .github/workflows/build-android.yml
+#
+# SEPARATE from build.yml ON PURPOSE: Android is unproven, and build.yml uses
+# fail-fast:true — a broken Android job in that matrix would CANCEL the working
+# desktop builds and break the airport-owner farm. Keep it isolated until green.
+#
+# ⚠️ UNVERIFIED DRAFT. Authored without ever running `tauri android init` (no
+#    Android SDK on hand), so expect the first runs to fail — most likely at the
+#    "reconcile custom android overlay" step (how the committed
+#    crates/tauri-app/android/* manifest + Kotlin map onto what init generates
+#    under gen/android). Trigger it, read the log, iterate. A ONE-TIME local
+#    `tauri android init` + commit of gen/android would de-risk this massively.
+#
+# Output: a DEBUG (unsigned) .apk you install on a phone to test. Real signed
+# release APKs (+ TV leanback variant) come later, once this connects.
+# =============================================================================
+name: build-android
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:    { description: "brand slug (optional — blank = default/unbranded)", required: false, default: "" }
+      version: { description: "release version, e.g. 1.4.2", required: false, default: "0.1.0" }
+
+concurrency:
+  group: build-android-${{ inputs.slug }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PRIVATE source (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: codeman9528/QuasarAPP
+          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+
+      - name: Setup Android SDK + NDK
+        uses: android-actions/setup-android@v3
+      - name: Install NDK
+        run: sdkmanager "ndk;26.1.10909125" "platforms;android-34" "build-tools;34.0.0"
+
+      - uses: dtolnay/rust-toolchain@1.82.0
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.12.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.1" --locked
+
+      - name: Build UI bundle
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -C apps/ui build
+
+      - name: Apply brand (optional)
+        if: inputs.slug != ''
+        run: cargo run -p quasar-builder -- apply --brand "brands/${{ inputs.slug }}/brand.yaml"
+
+      - name: Fetch geo + kernels (bundled into the apk assets)
+        shell: bash
+        run: |
+          bash scripts/fetch-geo.sh crates/tauri-app/resources/geo || echo "geo fetch failed (non-fatal for a build smoke-test)"
+          # NOTE: fetch-kernels.sh pulls desktop kernels; Android needs the
+          # arm64/arm7 kernel builds instead. Left for a follow-up — the JNI
+          # tunnel is the blocker before kernels matter on Android anyway.
+
+      - name: Init Android project (generates gen/android Gradle project)
+        env: { NDK_HOME: ${{ env.ANDROID_NDK_ROOT }} }
+        run: cargo tauri android init
+
+      # ⚠️ RISK STEP — reconcile the committed custom Android overlay (VPN
+      # manifest + QuasarVpnService/MainActivity Kotlin) onto the freshly
+      # generated project. The destination paths below are a BEST GUESS and are
+      # the most likely thing to fix on the first real run.
+      - name: Overlay custom Android sources (VpnService + manifest)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gen="crates/tauri-app/gen/android/app/src/main"
+          if [ -d "$gen" ]; then
+            cp -rv crates/tauri-app/android/app/src/main/kotlin "$gen/" || true
+            cp -v  crates/tauri-app/android/app/src/main/AndroidManifest.xml "$gen/AndroidManifest.xml" || true
+          else
+            echo "::warning::gen/android layout differs from the guess — inspect and fix this step"
+            find crates/tauri-app/gen/android -maxdepth 4 -type d | sort
+          fi
+
+      - name: Build debug APK
+        env: { NDK_HOME: ${{ env.ANDROID_NDK_ROOT }} }
+        run: cargo tauri android build --apk --debug
+
+      - name: Collect APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=$(find crates/tauri-app/gen/android -name '*.apk' | head -1 || true)
+          echo "path=$f" >> "$GITHUB_OUTPUT"
+          echo "· built apk: $f" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        if: steps.apk.outputs.path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: quasar-android-${{ inputs.slug || 'default' }}-debug
+          path: ${{ steps.apk.outputs.path }}
