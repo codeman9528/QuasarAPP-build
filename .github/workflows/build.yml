@@ -76,6 +76,10 @@ jobs:
             librsvg2-dev patchelf build-essential file
 
       - uses: dtolnay/rust-toolchain@1.82.0
+      # Go + CGO — qcore-sys's build.rs compiles sing-box as a c-shared lib.
+      # windows-latest ships MinGW gcc in PATH, which Go CGO uses by default.
+      - uses: actions/setup-go@v5
+        with: { go-version: 'stable' }
       - uses: Swatinem/rust-cache@v2
       - uses: pnpm/action-setup@v4
         with: { version: 9.12.0 }
@@ -121,8 +125,13 @@ jobs:
         shell: bash
         run: bash scripts/fetch-kernels.sh crates/tauri-app/resources/kernels
 
+      - name: Build qcore lib (embedded sing-box c-shared → bundled + staged
+              at runtime; keep build tags in sync with qcore-sys/build.rs)
+        shell: bash
+        run: bash scripts/stage-qcore-lib.sh crates/tauri-app/resources/qcore
+
       - name: Build app (installers + updater archives)
-        run: cargo tauri build
+        run: cargo tauri build --features qcore-embed
 
       - name: Collect updater archive + installer
         id: collect
