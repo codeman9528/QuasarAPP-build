@@ -130,6 +130,10 @@ jobs:
         shell: bash
         run: bash scripts/stage-qcore-lib.sh crates/tauri-app/resources/qcore
 
+      - name: Build qcore standalone binary (TUN — root helper spawns it)
+        shell: bash
+        run: bash scripts/build-qcore-bin.sh crates/tauri-app/resources/kernels/qcore
+
       - name: Build app (installers + updater archives)
         run: cargo tauri build --features qcore-embed
 
