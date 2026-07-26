@@ -2,31 +2,51 @@
 # build-android.yml  —  lives in the PUBLIC repo:  codeman9528/QuasarAPP-build
 # Copy to that repo at  .github/workflows/build-android.yml
 #
-# SEPARATE from build.yml ON PURPOSE: Android is unproven, and build.yml uses
-# fail-fast:true — a broken Android job in that matrix would CANCEL the working
-# desktop builds and break the airport-owner farm. Keep it isolated until green.
+# SEPARATE from build.yml ON PURPOSE: Android's toolchain (NDK + Go/gomobile AAR)
+# is heavier and newer, and build.yml uses fail-fast:true — a broken Android job
+# in that matrix would CANCEL the working desktop builds. Keep it isolated.
 #
-# ⚠️ UNVERIFIED DRAFT. Authored without ever running `tauri android init` (no
-#    Android SDK on hand), so expect the first runs to fail — most likely at the
-#    "reconcile custom android overlay" step (how the committed
-#    crates/tauri-app/android/* manifest + Kotlin map onto what init generates
-#    under gen/android). Trigger it, read the log, iterate. A ONE-TIME local
-#    `tauri android init` + commit of gen/android would de-risk this massively.
+# ── What it does (mirrors build.yml's decoupled model) ───────────────────────
+#   1. build the embedded sing-box core AAR (Go + gomobile, arm64 + arm7)
+#   2. apply brand, init the Android project, finalize gradle (AAR dep) + overlay
+#      the tracked VPN/L3 sources, build an UNSIGNED RELEASE universal APK
+#   3. upload the unsigned APK to R2 staging under installer/android-universal/
+#   4. dispatch the PRIVATE repo's sign.yml, which apksigner-signs the APK with
+#      the real release keystore (release environment) and publishes it to R2
+#      release + installers.json — the same path desktop installers take.
 #
-# Output: a DEBUG (unsigned) .apk you install on a phone to test. Real signed
-# release APKs (+ TV leanback variant) come later, once this connects.
+# The Android release keystore therefore lives ONLY in the private repo (as the
+# ANDROID_KEYSTORE_BASE64 / ANDROID_KEY_ALIAS / *_PASSWORD secrets), exactly like
+# the L3 updater key. This public build never sees it.
+#
+# ⚠️ First runs will need iteration — this was authored without a full CI dry run.
+#    Most likely spots: NDK version pinning, gomobile bind flags (see
+#    scripts/build-qcore-aar.sh), and the `tauri android init` → finalize/overlay
+#    reconciliation. Trigger it, read the log, iterate.
 # =============================================================================
 name: build-android
 
 on:
   workflow_dispatch:
     inputs:
-      slug:    { description: "brand slug (optional — blank = default/unbranded)", required: false, default: "" }
-      version: { description: "release version, e.g. 1.4.2", required: false, default: "0.1.0" }
+      slug:     { description: "brand slug (blank = default/unbranded)", required: false, default: "" }
+      version:  { description: "release version, e.g. 1.4.2", required: true }
+      build_id: { description: "orchestrator build id (echoed back to sign.yml)", required: true }
 
 concurrency:
   group: build-android-${{ inputs.slug }}
   cancel-in-progress: true
+
+env:
+  SLUG:     ${{ inputs.slug }}
+  VERSION:  ${{ inputs.version }}
+  BUILD_ID: ${{ inputs.build_id }}
+  # R2 staging endpoint + WRITE-ONLY-to-staging token (leak = throwaway bucket).
+  R2_ENDPOINT:           ${{ vars.R2_ENDPOINT }}
+  AWS_ACCESS_KEY_ID:     ${{ secrets.R2_STAGING_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_STAGING_SECRET }}
+  AWS_DEFAULT_REGION:    auto
+  STAGING_BUCKET:        ${{ vars.STAGING_BUCKET }}
 
 jobs:
   apk:
@@ -41,17 +61,21 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "17" }
 
-      - name: Setup Android SDK + NDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-      - name: Install NDK
-        run: sdkmanager "ndk;26.1.10909125" "platforms;android-34" "build-tools;34.0.0"
+      - name: Install NDK + platform + build-tools
+        run: sdkmanager "ndk;28.0.13004108" "platforms;android-34" "build-tools;34.0.0"
+
+      # Go is needed for the gomobile AAR (the embedded sing-box core).
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23" }
 
       - uses: dtolnay/rust-toolchain@1.82.0
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi
       - uses: Swatinem/rust-cache@v2
       - uses: pnpm/action-setup@v4
-        with: { version: 9.12.0 }
+        with: { version: 9 }
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: pnpm }
 
@@ -63,55 +87,72 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm -C apps/ui build
 
-      - name: Apply brand (optional)
+      - name: Apply brand
         if: inputs.slug != ''
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
         run: cargo run -p quasar-builder -- apply --brand "brands/${{ inputs.slug }}/brand.yaml"
 
-      - name: Fetch geo + kernels (bundled into the apk assets)
-        shell: bash
+      - name: Fetch geo databases (bundled into the apk assets)
+        run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo || echo "geo fetch failed (non-fatal for smoke build)"
+
+      - name: Build embedded sing-box core AAR (arm64 + arm7)
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: TARGETS=android/arm64,android/arm bash scripts/build-qcore-aar.sh
+
+      - name: Init Android project (generates gen/android)
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
         run: |
-          bash scripts/fetch-geo.sh crates/tauri-app/resources/geo || echo "geo fetch failed (non-fatal for a build smoke-test)"
-          # NOTE: fetch-kernels.sh pulls desktop kernels; Android needs the
-          # arm64/arm7 kernel builds instead. Left for a follow-up — the JNI
-          # tunnel is the blocker before kernels matter on Android anyway.
+          cd crates/tauri-app
+          cargo tauri android init
 
-      - name: Init Android project (generates gen/android Gradle project)
-        env: { NDK_HOME: ${{ env.ANDROID_NDK_ROOT }} }
-        run: cargo tauri android init
-
-      # ⚠️ RISK STEP — reconcile the committed custom Android overlay (VPN
-      # manifest + QuasarVpnService/MainActivity Kotlin) onto the freshly
-      # generated project. The destination paths below are a BEST GUESS and are
-      # the most likely thing to fix on the first real run.
-      - name: Overlay custom Android sources (VpnService + manifest)
-        shell: bash
+      - name: Finalize gradle (link the core AAR) + overlay VPN/L3 sources
         run: |
-          set -euxo pipefail
-          gen="crates/tauri-app/gen/android/app/src/main"
-          if [ -d "$gen" ]; then
-            cp -rv crates/tauri-app/android/app/src/main/kotlin "$gen/" || true
-            cp -v  crates/tauri-app/android/app/src/main/AndroidManifest.xml "$gen/AndroidManifest.xml" || true
-          else
-            echo "::warning::gen/android layout differs from the guess — inspect and fix this step"
-            find crates/tauri-app/gen/android -maxdepth 4 -type d | sort
-          fi
+          bash scripts/android-finalize-gradle.sh
+          bash scripts/android-overlay.sh
 
-      - name: Build debug APK
-        env: { NDK_HOME: ${{ env.ANDROID_NDK_ROOT }} }
-        run: cargo tauri android build --apk --debug
+      - name: Build UNSIGNED RELEASE universal APK (arm64-v8a + armeabi-v7a)
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        # No ANDROID_KEYSTORE in env → build-android-apk.sh leaves it unsigned;
+        # sign.yml signs it in the private repo with the real release key.
+        run: bash scripts/build-android-apk.sh
 
-      - name: Collect APK
-        id: apk
+      - name: Collect the unsigned release APK
+        id: collect
         shell: bash
         run: |
           set -euo pipefail
-          f=$(find crates/tauri-app/gen/android -name '*.apk' | head -1 || true)
-          echo "path=$f" >> "$GITHUB_OUTPUT"
-          echo "· built apk: $f" | tee -a "$GITHUB_STEP_SUMMARY"
+          apk="$(find crates/tauri-app/gen/android/app/build/outputs/apk/universal/release -name '*.apk' | head -1 || true)"
+          [ -n "$apk" ] || { echo "no release APK produced"; find crates/tauri-app/gen/android -name '*.apk'; exit 1; }
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$apk")" >> "$GITHUB_OUTPUT"
+          echo "· built $apk" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload APK artifact
-        if: steps.apk.outputs.path != ''
+      - name: Upload UNSIGNED APK to R2 staging (installer/android-universal)
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws s3 cp --endpoint-url "$R2_ENDPOINT" "${{ steps.collect.outputs.apk }}" \
+            "s3://$STAGING_BUCKET/$BUILD_ID/installer/android-universal/${{ steps.collect.outputs.name }}"
+
+      # Also keep the raw APK as a run artifact for manual QA installs.
+      - name: Upload APK run-artifact
         uses: actions/upload-artifact@v4
         with:
-          name: quasar-android-${{ inputs.slug || 'default' }}-debug
-          path: ${{ steps.apk.outputs.path }}
+          name: quasar-android-${{ inputs.slug || 'default' }}-release-unsigned
+          path: ${{ steps.collect.outputs.apk }}
+          retention-days: 7
+
+      - name: Dispatch private sign.yml (apksigner + publish)
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PRIVATE_DISPATCH_TOKEN }}
+          repository: codeman9528/QuasarAPP
+          event-type: brand-build-signed
+          client-payload: |
+            {"build_id":"${{ env.BUILD_ID }}","slug":"${{ env.SLUG }}","version":"${{ env.VERSION }}"}
