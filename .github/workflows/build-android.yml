@@ -66,6 +66,18 @@ jobs:
       - name: Install NDK + platform + build-tools
         run: sdkmanager "ndk;28.0.13004108" "platforms;android-34" "build-tools;34.0.0"
 
+      # Pin NDK_HOME to the exact NDK we just installed and export it to the job
+      # env. `${{ env.ANDROID_NDK_ROOT }}` isn't reliable in YAML (setup-android
+      # sets it only as a process var), and tauri android init hard-fails on a
+      # bad NDK_HOME. Exporting to $GITHUB_ENV makes it valid for every later step.
+      - name: Pin NDK_HOME
+        run: |
+          NDK="$ANDROID_HOME/ndk/28.0.13004108"
+          test -d "$NDK" || { echo "NDK not at $NDK"; ls "$ANDROID_HOME/ndk" || true; exit 1; }
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
       # Go is needed for the gomobile AAR (the embedded sing-box core).
       - uses: actions/setup-go@v5
         with: { go-version: "1.23" }
