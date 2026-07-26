@@ -74,8 +74,10 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
       - uses: Swatinem/rust-cache@v2
+      # No `version:` here — pnpm/action-setup@v4 errors if a version is given
+      # both here AND via package.json's packageManager field. package.json pins
+      # pnpm@9.12.0, so let the action read it from there.
       - uses: pnpm/action-setup@v4
-        with: { version: 9 }
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: pnpm }
 
