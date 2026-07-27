@@ -32,6 +32,7 @@ on:
       slug:     { description: "brand slug (blank = default/unbranded)", required: false, default: "" }
       version:  { description: "release version, e.g. 1.4.2", required: true }
       build_id: { description: "orchestrator build id (echoed back to sign.yml)", required: true }
+      notes:    { description: "更新内容 (release notes, shown in the client update dialog)", required: false, default: "" }
 
 concurrency:
   group: build-android-${{ inputs.slug }}
@@ -223,4 +224,4 @@ jobs:
           repository: codeman9528/QuasarAPP
           event-type: brand-build-signed
           client-payload: |
-            {"build_id":"${{ env.BUILD_ID }}","slug":"${{ env.SLUG }}","version":"${{ env.VERSION }}"}
+            {"build_id":"${{ env.BUILD_ID }}","slug":"${{ env.SLUG }}","version":"${{ env.VERSION }}","notes":${{ toJSON(inputs.notes) }}}
