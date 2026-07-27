@@ -149,6 +149,12 @@ jobs:
 
       - name: Upload UNSIGNED APK to R2 staging (installer/android-universal)
         shell: bash
+        env:
+          # aws cli v2.23+ defaults to sending CRC checksums + a streaming-unsigned
+          # payload trailer, which Cloudflare R2's SigV4 rejects (401 Unauthorized).
+          # Force the legacy behavior so R2 accepts the request.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
           set -euo pipefail
           # Single-part PUT (s3api put-object), NOT `aws s3 cp` — cp auto-switches
