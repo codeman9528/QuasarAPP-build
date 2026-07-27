@@ -1,0 +1,27 @@
+name: r2-upload-test
+on: { workflow_dispatch: {} }
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      R2_ENDPOINT:           ${{ vars.R2_ENDPOINT }}
+      STAGING_BUCKET:        ${{ vars.STAGING_BUCKET }}
+      AWS_ACCESS_KEY_ID:     ${{ secrets.R2_STAGING_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_STAGING_SECRET }}
+      AWS_DEFAULT_REGION:    auto
+    steps:
+      - name: aws version
+        run: aws --version
+      - name: make 50MB file
+        run: head -c 52428800 /dev/urandom > /tmp/big.bin
+      - name: PUT default (no checksum env) — expect fail
+        continue-on-error: true
+        run: aws s3api put-object --endpoint-url "$R2_ENDPOINT" --bucket "$STAGING_BUCKET" --key _test/default.bin --body /tmp/big.bin >/dev/null && echo "DEFAULT OK" || echo "DEFAULT FAILED"
+      - name: PUT with checksum=when_required — expect ok
+        env:
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          aws s3api put-object --endpoint-url "$R2_ENDPOINT" --bucket "$STAGING_BUCKET" --key _test/fixed.bin --body /tmp/big.bin >/dev/null && echo "FIXED OK"
+          aws s3api delete-object --endpoint-url "$R2_ENDPOINT" --bucket "$STAGING_BUCKET" --key _test/fixed.bin >/dev/null || true
+          aws s3api delete-object --endpoint-url "$R2_ENDPOINT" --bucket "$STAGING_BUCKET" --key _test/default.bin >/dev/null || true
