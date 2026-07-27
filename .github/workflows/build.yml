@@ -150,14 +150,18 @@ jobs:
         run: |
           set -euo pipefail
           bid="${{ inputs.build_id }}"; arch="${{ matrix.arch }}"
-          # Updater archive (sign.yml re-signs it). We do NOT upload the
-          # ephemeral .sig — sign.yml produces the real one.
-          aws s3 cp --endpoint-url "$R2_ENDPOINT" "${{ steps.collect.outputs.updater }}" \
-            "s3://$STAGING_BUCKET/$bid/updater/$arch/${{ steps.collect.outputs.updater_name }}"
+          # Single-part PUT (s3api put-object), NOT `aws s3 cp`: cp goes multipart
+          # for files >8MB and R2 bucket-scoped tokens reject CreateMultipartUpload.
+          aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$STAGING_BUCKET" \
+            --key "$bid/updater/$arch/${{ steps.collect.outputs.updater_name }}" \
+            --body "${{ steps.collect.outputs.updater }}" >/dev/null
           # Installer (direct download; not Tauri-signed).
           if [ -n "${{ steps.collect.outputs.installer_name }}" ]; then
-            aws s3 cp --endpoint-url "$R2_ENDPOINT" "${{ steps.collect.outputs.installer }}" \
-              "s3://$STAGING_BUCKET/$bid/installer/$arch/${{ steps.collect.outputs.installer_name }}"
+            aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
+              --bucket "$STAGING_BUCKET" \
+              --key "$bid/installer/$arch/${{ steps.collect.outputs.installer_name }}" \
+              --body "${{ steps.collect.outputs.installer }}" >/dev/null
           else
             echo "no installer bundle for $arch (check tauri.conf bundle targets)"
           fi
