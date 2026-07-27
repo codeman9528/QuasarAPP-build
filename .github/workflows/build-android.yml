@@ -127,6 +127,23 @@ jobs:
       - name: Fetch geo databases (bundled into the apk assets)
         run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo || echo "geo fetch failed (non-fatal for smoke build)"
 
+      # White-label identity split. The Kotlin package + JNI exports are hardcoded
+      # io.quasar.app, so the android CODE identity (namespace / generated glue /
+      # R / manifest .MainActivity) must stay io.quasar.app. Apply brand set
+      # tauri.conf identifier to the brand — capture it as the applicationId, then
+      # reset the identifier to io.quasar.app so `tauri android init` generates all
+      # code under io.quasar.app. finalize-gradle re-applies ANDROID_APP_ID as the
+      # applicationId only. (Skipped when unbranded — identifier is already
+      # io.quasar.app.) DESKTOP is unaffected: it uses the brand identifier as-is.
+      - name: Pin android code identity to io.quasar.app; brand the applicationId
+        if: inputs.slug != ''
+        run: |
+          conf=crates/tauri-app/tauri.conf.json
+          brand_id="$(python3 -c "import json;print(json.load(open('$conf'))['identifier'])")"
+          echo "ANDROID_APP_ID=$brand_id" >> "$GITHUB_ENV"
+          python3 -c "import json;p='$conf';d=json.load(open(p));d['identifier']='io.quasar.app';json.dump(d,open(p,'w'),indent=2)"
+          echo "code identity → io.quasar.app; applicationId → $brand_id"
+
       - name: Build embedded sing-box core AAR (arm64 + arm7)
         env:
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
