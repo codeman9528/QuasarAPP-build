@@ -20,6 +20,7 @@ on:
       slug:      { description: "brand slug (brands/<slug>/brand.yaml must exist in the private repo)", required: true }
       version:   { description: "release version, e.g. 1.4.2", required: true }
       build_id:  { description: "orchestrator build id (echoed back in the dispatch)", required: true }
+      notes:     { description: "更新内容 (release notes, shown in the client update dialog)", required: false, default: "" }
 
 concurrency:
   group: build-${{ inputs.slug }}-${{ inputs.version }}
@@ -190,5 +191,6 @@ jobs:
             {
               "build_id": "${{ inputs.build_id }}",
               "slug": "${{ inputs.slug }}",
-              "version": "${{ inputs.version }}"
+              "version": "${{ inputs.version }}",
+              "notes": ${{ toJSON(inputs.notes) }}
             }
