@@ -107,6 +107,23 @@ jobs:
           TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
         run: cargo run -p quasar-builder -- apply --brand "brands/${{ inputs.slug }}/brand.yaml"
 
+      # Regenerate the FULL icon set (incl. Android launcher mipmaps under
+      # icons/android/) from the operator's uploaded logo, so the console's custom
+      # icon reaches the APK — same step the desktop build.yml runs. Without this
+      # the Android launcher icon stayed the repo default. `cargo tauri android
+      # init` below picks up icons/android/* into gen/android's res/mipmap-*.
+      - name: Regenerate icon set from brand icon.png (if the console uploaded one)
+        if: inputs.slug != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "brands/${{ inputs.slug }}/icon.png" ]; then
+            echo "branding app icon from brands/${{ inputs.slug }}/icon.png"
+            cargo tauri icon "brands/${{ inputs.slug }}/icon.png" -o crates/tauri-app/icons
+          else
+            echo "no brand icon.png — using repo default icons"
+          fi
+
       - name: Fetch geo databases (bundled into the apk assets)
         run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo || echo "geo fetch failed (non-fatal for smoke build)"
 
@@ -143,8 +160,16 @@ jobs:
           set -euo pipefail
           apk="$(find crates/tauri-app/gen/android/app/build/outputs/apk/universal/release -name '*.apk' | head -1 || true)"
           [ -n "$apk" ] || { echo "no release APK produced"; find crates/tauri-app/gen/android -name '*.apk'; exit 1; }
+          # Rename the generic app-universal-release.apk to the operator's brand
+          # name + version (desktop bundles are already productName-named; keep
+          # Android consistent). productName is the brand name after Apply brand.
+          product="$(python3 -c "import json;print(json.load(open('crates/tauri-app/tauri.conf.json'))['productName'])")"
+          safe="$(printf '%s' "$product" | tr ' /' '__')"
+          newname="${safe}_${{ inputs.version }}_universal.apk"
+          mv "$apk" "$(dirname "$apk")/$newname"
+          apk="$(dirname "$apk")/$newname"
           echo "apk=$apk" >> "$GITHUB_OUTPUT"
-          echo "name=$(basename "$apk")" >> "$GITHUB_OUTPUT"
+          echo "name=$newname" >> "$GITHUB_OUTPUT"
           echo "· built $apk" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload UNSIGNED APK to R2 staging (installer/android-universal)
