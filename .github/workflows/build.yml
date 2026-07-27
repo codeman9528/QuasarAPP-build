@@ -26,9 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Operator-wide PUBLIC keys — repo *variables*, not secrets (pubkeys aren't secret).
-  QUASAR_UI_PUBKEY:      ${{ vars.QUASAR_UI_PUBKEY }}
-  QUASAR_KERNEL_PUBKEY:  ${{ vars.QUASAR_KERNEL_PUBKEY }}
+  # Operator-wide PUBLIC key — repo *variable*, not a secret (pubkeys aren't secret).
   TAURI_UPDATER_PUBKEY:  ${{ vars.TAURI_UPDATER_PUBKEY }}
   # R2 staging endpoint + WRITE-ONLY-to-staging token (leak = throwaway bucket only).
   R2_ENDPOINT:           ${{ vars.R2_ENDPOINT }}            # https://<acct>.r2.cloudflarestorage.com
@@ -76,13 +74,10 @@ jobs:
             librsvg2-dev patchelf build-essential file
 
       - uses: dtolnay/rust-toolchain@1.82.0
-      # Go + CGO — qcore-sys's build.rs compiles sing-box as a c-shared lib.
-      # windows-latest ships MinGW gcc in PATH, which Go CGO uses by default.
-      - uses: actions/setup-go@v5
-        with: { go-version: 'stable' }
       - uses: Swatinem/rust-cache@v2
+      # No version here — pnpm/action-setup@v4 errors if a version is set both
+      # here AND via package.json's packageManager (pnpm@9.12.0). Let it read that.
       - uses: pnpm/action-setup@v4
-        with: { version: 9.12.0 }
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: pnpm }
 
@@ -125,17 +120,8 @@ jobs:
         shell: bash
         run: bash scripts/fetch-kernels.sh crates/tauri-app/resources/kernels
 
-      - name: Build qcore lib (embedded sing-box c-shared → bundled + staged
-              at runtime; keep build tags in sync with qcore-sys/build.rs)
-        shell: bash
-        run: bash scripts/stage-qcore-lib.sh crates/tauri-app/resources/qcore
-
-      - name: Build qcore standalone binary (TUN — root helper spawns it)
-        shell: bash
-        run: bash scripts/build-qcore-bin.sh crates/tauri-app/resources/kernels/qcore
-
       - name: Build app (installers + updater archives)
-        run: cargo tauri build --features qcore-embed
+        run: cargo tauri build
 
       - name: Collect updater archive + installer
         id: collect
