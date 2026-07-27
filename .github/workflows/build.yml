@@ -131,8 +131,11 @@ jobs:
           base="target/release/bundle"
           case "${{ matrix.arch }}" in
             linux-*)
-              up=$(ls "$base"/appimage/*.AppImage.tar.gz)
-              inst=$(ls "$base"/appimage/*.AppImage 2>/dev/null | head -1 || true) ;;
+              # Tauri 2 signs the AppImage directly (…AppImage + …AppImage.sig),
+              # NOT a .AppImage.tar.gz. The AppImage is both the updater artifact
+              # and the direct-download installer.
+              up=$(ls "$base"/appimage/*.AppImage | head -1)
+              inst="$up" ;;
             windows-*)
               up=$(ls "$base"/nsis/*-setup.nsis.zip)
               inst=$(ls "$base"/nsis/*-setup.exe 2>/dev/null | head -1 || true) ;;
