@@ -147,6 +147,11 @@ jobs:
 
       - name: Upload UNSIGNED updater + installer to R2 staging
         shell: bash
+        env:
+          # Force legacy checksum behavior — aws cli v2.23+ CRC checksums make
+          # Cloudflare R2 reject the request (401 Unauthorized).
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
           set -euo pipefail
           bid="${{ inputs.build_id }}"; arch="${{ matrix.arch }}"
