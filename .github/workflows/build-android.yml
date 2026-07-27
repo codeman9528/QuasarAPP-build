@@ -151,8 +151,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          aws s3 cp --endpoint-url "$R2_ENDPOINT" "${{ steps.collect.outputs.apk }}" \
-            "s3://$STAGING_BUCKET/$BUILD_ID/installer/android-universal/${{ steps.collect.outputs.name }}"
+          # Single-part PUT (s3api put-object), NOT `aws s3 cp` — cp auto-switches
+          # to multipart for files >8MB, and R2 bucket-scoped tokens reject
+          # CreateMultipartUpload ("Unauthorized"). put-object is one PUT (≤5GB ok).
+          aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$STAGING_BUCKET" \
+            --key "$BUILD_ID/installer/android-universal/${{ steps.collect.outputs.name }}" \
+            --body "${{ steps.collect.outputs.apk }}" >/dev/null
+          echo "· uploaded to s3://$STAGING_BUCKET/$BUILD_ID/installer/android-universal/${{ steps.collect.outputs.name }}"
 
       # Also keep the raw APK as a run artifact for manual QA installs.
       - name: Upload APK run-artifact
