@@ -2,9 +2,15 @@
 # build-android.yml  —  lives in the PUBLIC repo:  codeman9528/QuasarAPP-build
 # Copy to that repo at  .github/workflows/build-android.yml
 #
-# SEPARATE from build.yml ON PURPOSE: Android's toolchain (NDK + Go/gomobile AAR)
-# is heavier and newer, and build.yml uses fail-fast:true — a broken Android job
-# in that matrix would CANCEL the working desktop builds. Keep it isolated.
+# ⚠️ MANUAL ESCAPE HATCH ONLY. The console now triggers build.yml, which has an
+# absorbed `android` job + a single fan-in hand-off to sign.yml (one build_id →
+# one signed bundle → one installers.json). Use THIS file only for android-only
+# manual runs / debugging. Do NOT run it for a build_id that build.yml is also
+# handling — both dispatch sign.yml, which would double-sign / race.
+#
+# It stays a separate FILE (not a build.yml matrix row) because Android's
+# toolchain (NDK + Go/gomobile AAR) is heavier; build.yml isolates it as its own
+# job so a broken android build can't fail-fast-cancel the desktop matrix.
 #
 # ── What it does (mirrors build.yml's decoupled model) ───────────────────────
 #   1. build the embedded sing-box core AAR (Go + gomobile, arm64 + arm7)
