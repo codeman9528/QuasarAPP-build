@@ -3,14 +3,28 @@
 # Copy this file to that repo at  .github/workflows/build.yml
 #
 # Heavy, free compile of a branded Quasar client. NO real signing key here:
-# we build updater artifacts with a throwaway ephemeral key (its .sig is
-# discarded), upload the unsigned artifacts to R2 staging, then hand off to the
-# private repo's sign.yml which re-signs with the real L3 key.
+# desktop updater artifacts are built with a throwaway ephemeral key (.sig
+# discarded); the Android APK is left UNSIGNED. Everything is uploaded to R2
+# staging under one $BUILD_ID/ prefix, then ONE hand-off dispatches the private
+# repo's sign.yml which re-signs with the real L3 / release keys.
 #
-# See docs/build-farm/DESIGN.md + docs/adr/013-branded-build-release-pipeline.md
+# ── Single-workflow fan-in (ADR-013 + console targets) ───────────────────────
+# The console passes `targets` (windows,macos,linux,android,androidtv). A `setup`
+# job turns that into a desktop build matrix + an android flag; `compile` and
+# `android` run only for selected platforms; `handoff` waits for BOTH and
+# dispatches sign.yml EXACTLY ONCE. sign.yml pulls the whole $BUILD_ID/ staging
+# and signs whatever is there, so a mixed desktop+android build yields ONE
+# signed bundle with ONE merged installers.json — no manifest clobber, one
+# callback. (Previously android lived in a separate build-android.yml the
+# console never triggered, and two independent sign runs clobbered the manifest.)
 #
-# NOTE: pin every third-party action to a commit SHA before production
-#       (shown here with version tags for readability).
+# ⚠️ AUTHORED WITHOUT A FULL CI DRY RUN — expect iteration. Likely spots: the
+#    dynamic matrix (fromJSON), the android job's NDK/gomobile steps (same ones
+#    build-android.yml is still shaking out), and the handoff `if:` gating.
+#    build-android.yml is KEPT as a manual android-only escape hatch; the console
+#    path is THIS file. Do not run both for one build_id (double sign dispatch).
+#
+# NOTE: pin every third-party action to a commit SHA before production.
 # =============================================================================
 name: build
 
@@ -21,12 +35,16 @@ on:
       version:   { description: "release version, e.g. 1.4.2", required: true }
       build_id:  { description: "orchestrator build id (echoed back in the dispatch)", required: true }
       notes:     { description: "更新内容 (release notes, shown in the client update dialog)", required: false, default: "" }
+      targets:   { description: "comma-separated platforms: windows,macos,linux,android,androidtv (blank = all)", required: false, default: "" }
 
 concurrency:
   group: build-${{ inputs.slug }}-${{ inputs.version }}
   cancel-in-progress: false
 
 env:
+  SLUG:     ${{ inputs.slug }}
+  VERSION:  ${{ inputs.version }}
+  BUILD_ID: ${{ inputs.build_id }}
   # Operator-wide PUBLIC key — repo *variable*, not a secret (pubkeys aren't secret).
   TAURI_UPDATER_PUBKEY:  ${{ vars.TAURI_UPDATER_PUBKEY }}
   # R2 staging endpoint + WRITE-ONLY-to-staging token (leak = throwaway bucket only).
@@ -37,15 +55,44 @@ env:
   STAGING_BUCKET:        ${{ vars.STAGING_BUCKET }}         # e.g. quasar-staging
 
 jobs:
+  # ── Plan which platform jobs run, from the console's `targets` list ──────────
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
+      build_android:  ${{ steps.plan.outputs.build_android }}
+    steps:
+      - name: Plan jobs from targets
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets="${{ inputs.targets }}"
+          [ -z "$targets" ] && targets="windows,macos,linux,android,androidtv"
+          matrix="[]"; android=false
+          IFS=',' read -ra T <<< "$targets"
+          for t in "${T[@]}"; do
+            t="$(echo "$t" | xargs)"   # trim whitespace
+            case "$t" in
+              windows) matrix=$(jq -c '. + [{"os":"windows-latest","arch":"windows-x86_64"}]' <<<"$matrix") ;;
+              macos)   matrix=$(jq -c '. + [{"os":"macos-14","arch":"darwin-aarch64"}]' <<<"$matrix") ;;
+              linux)   matrix=$(jq -c '. + [{"os":"ubuntu-latest","arch":"linux-x86_64"}]' <<<"$matrix") ;;
+              android|androidtv) android=true ;;
+              *) echo "::warning::unknown target ignored: $t" ;;
+            esac
+          done
+          echo "desktop_matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "build_android=$android" >> "$GITHUB_OUTPUT"
+          echo "· plan: desktop=$matrix  android=$android" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ── Desktop compile (one job per selected desktop arch) ──────────────────────
   compile:
+    needs: setup
+    if: ${{ needs.setup.outputs.desktop_matrix != '[]' }}
     strategy:
       fail-fast: true
       matrix:
-        include:
-          - { os: ubuntu-latest,  arch: linux-x86_64   }
-          - { os: windows-latest, arch: windows-x86_64 }
-          - { os: macos-14,       arch: darwin-aarch64 }
-          # add { os: macos-13, arch: darwin-x86_64 } for Intel macs
+        include: ${{ fromJSON(needs.setup.outputs.desktop_matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout PRIVATE source (read-only deploy key)
@@ -55,8 +102,7 @@ jobs:
           ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
 
       # Builds float to main HEAD (no per-build ref pin), so record the exact
-      # commit that produced this artifact — provenance + reproducibility. Shows
-      # in the run summary and is exported for later steps / debugging.
+      # commit that produced this artifact — provenance + reproducibility.
       - name: Record source commit
         id: src
         shell: bash
@@ -64,7 +110,7 @@ jobs:
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "· built ${{ inputs.slug }} v${{ inputs.version }} from private@$sha" \
+          echo "· built ${{ inputs.slug }} v${{ inputs.version }} ${{ matrix.arch }} from private@$sha" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Linux build deps
@@ -177,11 +223,170 @@ jobs:
             echo "no installer bundle for $arch (check tauri.conf bundle targets)"
           fi
 
-  handoff:
-    needs: compile
+  # ── Android compile (universal APK; runs only when android/androidtv selected) ─
+  # Mirrors build-android.yml's `apk` job, MINUS its own sign dispatch — the
+  # shared `handoff` job dispatches sign.yml once for desktop + android together.
+  android:
+    needs: setup
+    if: ${{ needs.setup.outputs.build_android == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch private sign.yml
+      - name: Checkout PRIVATE source (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: codeman9528/QuasarAPP
+          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install NDK + platform + build-tools
+        run: sdkmanager "ndk;28.0.13004108" "platforms;android-34" "build-tools;34.0.0"
+
+      # Pin NDK_HOME to the exact NDK we just installed (setup-android sets
+      # ANDROID_NDK_ROOT only as a process var; tauri android init hard-fails on a
+      # bad NDK_HOME). Exporting to $GITHUB_ENV makes it valid for every later step.
+      - name: Pin NDK_HOME
+        run: |
+          NDK="$ANDROID_HOME/ndk/28.0.13004108"
+          test -d "$NDK" || { echo "NDK not at $NDK"; ls "$ANDROID_HOME/ndk" || true; exit 1; }
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      # Go is needed for the gomobile AAR (the embedded sing-box core).
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23" }
+
+      - uses: dtolnay/rust-toolchain@1.82.0
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.1" --locked
+
+      - name: Build UI bundle
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -C apps/ui build
+
+      - name: Apply brand
+        if: inputs.slug != ''
+        run: cargo run -p quasar-builder -- apply --brand "brands/${{ inputs.slug }}/brand.yaml"
+
+      # Regenerate the FULL icon set (incl. Android launcher mipmaps) from the
+      # operator's uploaded logo so the console's custom icon reaches the APK.
+      - name: Regenerate icon set from brand icon.png (if the console uploaded one)
+        if: inputs.slug != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "brands/${{ inputs.slug }}/icon.png" ]; then
+            echo "branding app icon from brands/${{ inputs.slug }}/icon.png"
+            cargo tauri icon "brands/${{ inputs.slug }}/icon.png" -o crates/tauri-app/icons
+          else
+            echo "no brand icon.png — using repo default icons"
+          fi
+
+      - name: Fetch geo databases (bundled into the apk assets)
+        run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo || echo "geo fetch failed (non-fatal)"
+
+      # White-label identity split: Kotlin package + JNI exports are hardcoded
+      # io.quasar.app, so the android CODE identity must stay io.quasar.app.
+      # Capture the brand identifier as the applicationId, reset the identifier to
+      # io.quasar.app so `tauri android init` generates code under io.quasar.app;
+      # finalize-gradle re-applies ANDROID_APP_ID as the applicationId only.
+      - name: Pin android code identity to io.quasar.app; brand the applicationId
+        if: inputs.slug != ''
+        run: |
+          conf=crates/tauri-app/tauri.conf.json
+          brand_id="$(python3 -c "import json;print(json.load(open('$conf'))['identifier'])")"
+          echo "ANDROID_APP_ID=$brand_id" >> "$GITHUB_ENV"
+          python3 -c "import json;p='$conf';d=json.load(open(p));d['identifier']='io.quasar.app';json.dump(d,open(p,'w'),indent=2)"
+          echo "code identity → io.quasar.app; applicationId → $brand_id"
+
+      - name: Build embedded sing-box core AAR (arm64 + arm7)
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: TARGETS=android/arm64,android/arm bash scripts/build-qcore-aar.sh
+
+      - name: Init Android project (generates gen/android)
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: |
+          cd crates/tauri-app
+          cargo tauri android init
+
+      - name: Finalize gradle (link the core AAR) + overlay VPN/L3 sources
+        run: |
+          bash scripts/android-finalize-gradle.sh
+          bash scripts/android-overlay.sh
+
+      - name: Build UNSIGNED RELEASE universal APK (arm64-v8a + armeabi-v7a)
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        # No ANDROID_KEYSTORE in env → build-android-apk.sh leaves it unsigned;
+        # sign.yml signs it in the private repo with the real release key.
+        run: bash scripts/build-android-apk.sh
+
+      - name: Collect the unsigned release APK
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="$(find crates/tauri-app/gen/android/app/build/outputs/apk/universal/release -name '*.apk' | head -1 || true)"
+          [ -n "$apk" ] || { echo "no release APK produced"; find crates/tauri-app/gen/android -name '*.apk'; exit 1; }
+          # Rename to the operator's brand name + version (desktop bundles are
+          # already productName-named; keep Android consistent).
+          product="$(python3 -c "import json;print(json.load(open('crates/tauri-app/tauri.conf.json'))['productName'])")"
+          safe="$(printf '%s' "$product" | tr ' /' '__')"
+          newname="${safe}_${{ inputs.version }}_universal.apk"
+          mv "$apk" "$(dirname "$apk")/$newname"
+          apk="$(dirname "$apk")/$newname"
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+          echo "name=$newname" >> "$GITHUB_OUTPUT"
+          echo "· built $apk" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload UNSIGNED APK to R2 staging (installer/android-universal)
+        shell: bash
+        env:
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          set -euo pipefail
+          aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$STAGING_BUCKET" \
+            --key "$BUILD_ID/installer/android-universal/${{ steps.collect.outputs.name }}" \
+            --body "${{ steps.collect.outputs.apk }}" >/dev/null
+          echo "· uploaded to s3://$STAGING_BUCKET/$BUILD_ID/installer/android-universal/${{ steps.collect.outputs.name }}"
+
+      # Keep the raw APK as a run artifact for manual QA installs.
+      - name: Upload APK run-artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quasar-android-${{ inputs.slug || 'default' }}-release-unsigned
+          path: ${{ steps.collect.outputs.apk }}
+          retention-days: 7
+
+  # ── Fan-in: dispatch sign.yml ONCE after all selected builds succeed ─────────
+  handoff:
+    needs: [setup, compile, android]
+    # Run when nothing FAILED and at least one build job actually produced output.
+    # (compile/android are 'skipped' when their platform wasn't selected — fine.)
+    if: >-
+      ${{ always()
+          && needs.compile.result != 'failure' && needs.compile.result != 'cancelled'
+          && needs.android.result != 'failure' && needs.android.result != 'cancelled'
+          && (needs.compile.result == 'success' || needs.android.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch private sign.yml (once, for all built platforms)
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.PRIVATE_DISPATCH_TOKEN }}   # fine-grained PAT: dispatch on codeman9528/QuasarAPP
