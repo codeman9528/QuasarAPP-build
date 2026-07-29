@@ -119,8 +119,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
+          # `rpm` provides rpmbuild — without it Tauri silently skips the .rpm
+          # bundle. dpkg-dev backs the .deb. (webkit2gtk etc. for the app itself.)
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
-            librsvg2-dev patchelf build-essential file
+            librsvg2-dev patchelf build-essential file rpm dpkg-dev
 
       - uses: dtolnay/rust-toolchain@1.82.0
       - uses: Swatinem/rust-cache@v2
