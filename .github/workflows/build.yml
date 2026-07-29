@@ -192,7 +192,25 @@ jobs:
               inst="$up" ;;
             darwin-*)
               up=$(ls "$base"/macos/*.app.tar.gz)
-              inst=$(ls "$base"/dmg/*.dmg 2>/dev/null | head -1 || true) ;;
+              # Ship a .pkg installer, NOT the .dmg. A pkg installer writes the app
+              # FRESH into /Applications, so the installed app carries no
+              # com.apple.quarantine flag → it launches with zero Gatekeeper
+              # prompts even though we don't notarize (this is how the mainstream
+              # un-notarized clients ship). A dragged-out .dmg app inherits the
+              # download's quarantine → the "已损坏" dead-end on Apple Silicon.
+              # Unsigned pkg over an ad-hoc-signed app — no Apple Developer account.
+              app=$(ls -d "$base"/macos/*.app | head -1)
+              appname=$(basename "$app" .app)
+              ident=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/Contents/Info.plist")
+              ver=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Contents/Info.plist")
+              a="${{ matrix.arch }}"; a="${a#darwin-}"
+              comp="$RUNNER_TEMP/component.pkg"
+              inst="$RUNNER_TEMP/${appname}_${ver}_${a}.pkg"
+              pkgbuild --install-location /Applications --component "$app" \
+                       --identifier "$ident" --version "$ver" "$comp"
+              # productbuild wraps the component so Installer shows the standard
+              # wizard (介绍 / 目的宗卷 / 安装类型 / 安装 / 摘要).
+              productbuild --package "$comp" "$inst" ;;
           esac
           echo "updater=$up" >> "$GITHUB_OUTPUT"
           echo "updater_name=$(basename "$up")" >> "$GITHUB_OUTPUT"
