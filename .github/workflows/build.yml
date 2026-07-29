@@ -90,7 +90,9 @@ jobs:
     needs: setup
     if: ${{ needs.setup.outputs.desktop_matrix != '[]' }}
     strategy:
-      fail-fast: true
+      # Partial success: one arch failing must NOT cancel the others — they still
+      # build + stage, and handoff publishes whatever succeeded.
+      fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.setup.outputs.desktop_matrix) }}
     runs-on: ${{ matrix.os }}
@@ -379,11 +381,15 @@ jobs:
     needs: [setup, compile, android]
     # Run when nothing FAILED and at least one build job actually produced output.
     # (compile/android are 'skipped' when their platform wasn't selected — fine.)
+    # Partial success: hand off as long as the run wasn't cancelled and setup
+    # produced a plan — even if SOME platforms failed. sign.yml publishes whatever
+    # actually staged (it tolerates missing platforms) and its own guard fails the
+    # sign job if NOTHING staged (all platforms failed → build reported failed).
+    # (With fail-fast:false a partial failure leaves compile.result == 'failure'
+    # while successful legs still staged, which the old gate wrongly blocked.)
     if: >-
-      ${{ always()
-          && needs.compile.result != 'failure' && needs.compile.result != 'cancelled'
-          && needs.android.result != 'failure' && needs.android.result != 'cancelled'
-          && (needs.compile.result == 'success' || needs.android.result == 'success') }}
+      ${{ !cancelled() && needs.setup.result == 'success'
+          && (needs.compile.result != 'skipped' || needs.android.result != 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch private sign.yml (once, for all built platforms)
