@@ -353,6 +353,25 @@ jobs:
             echo "no brand icon.png — using repo default icons"
           fi
 
+      # Android-TV 16:9 banner (320×180) from the brand icon — shown on the TV
+      # home launcher. Best-effort: a committed default tv_banner.png already
+      # exists in the overlay res, so a failure here just keeps the default (the
+      # manifest's @drawable/tv_banner always resolves → build never breaks).
+      - name: Generate branded TV banner (Android)
+        if: inputs.slug != ''
+        shell: bash
+        run: |
+          SRC="brands/${{ inputs.slug }}/icon.png"
+          DEST="crates/tauri-app/android/app/src/main/res/drawable/tv_banner.png"
+          [ -f "$SRC" ] || { echo "no brand icon — keeping default TV banner"; exit 0; }
+          sudo apt-get install -y imagemagick >/dev/null 2>&1 || true
+          M=convert; command -v magick >/dev/null 2>&1 && M=magick
+          if "$M" -size 320x180 "xc:#191228" \( "$SRC" -resize 132x132 \) -gravity center -composite "$DEST"; then
+            echo "branded TV banner from $SRC"
+          else
+            echo "banner generation failed — keeping committed default"
+          fi
+
       - name: Fetch geo databases (bundled into the apk assets)
         run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo || echo "geo fetch failed (non-fatal)"
 
