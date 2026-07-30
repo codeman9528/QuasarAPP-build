@@ -171,21 +171,18 @@ jobs:
         shell: bash
         run: bash scripts/fetch-kernels.sh crates/tauri-app/resources/kernels
 
-      # The desktop TUN root helper is a separate binary bundled into the app's
-      # Resources/helper (all 3 desktop confs list "resources/helper":"helper").
-      # It's gitignored, so CI must build it here or the app ships without it and
-      # TUN fails with "helper binary not found". Host-native build matches the
-      # `cargo tauri build` target below.
-      - name: Build TUN root helper (bundled into Resources/helper)
+      # The desktop TUN root helper (binary + macOS launchd plist) is bundled into
+      # the app's Resources/helper (all 3 desktop confs list "resources/helper").
+      # Both are gitignored, so CI must stage them or TUN install fails with
+      # "helper binary not found" / "launchd plist not found". stage-helper.sh
+      # builds the binary AND generates the plist with the brand slug substituted
+      # into the launchd Label / socket path (must run AFTER the brand patch so
+      # the plist's io.<slug>.helper matches the client's brand-aware socket).
+      - name: Build + stage TUN root helper (binary + brand plist)
         shell: bash
-        run: |
-          set -euo pipefail
-          cargo build -p quasar-helper --release
-          mkdir -p crates/tauri-app/resources/helper
-          case "${{ matrix.arch }}" in
-            windows-*) cp target/release/quasar-helper.exe crates/tauri-app/resources/helper/quasar-helper.exe ;;
-            *)         cp target/release/quasar-helper       crates/tauri-app/resources/helper/quasar-helper ;;
-          esac
+        env:
+          QUASAR_APP_SLUG: ${{ inputs.slug }}
+        run: bash scripts/stage-helper.sh
 
       - name: Build app (installers + updater archives)
         run: cargo tauri build
