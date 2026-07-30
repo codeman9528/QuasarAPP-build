@@ -171,6 +171,22 @@ jobs:
         shell: bash
         run: bash scripts/fetch-kernels.sh crates/tauri-app/resources/kernels
 
+      # The desktop TUN root helper is a separate binary bundled into the app's
+      # Resources/helper (all 3 desktop confs list "resources/helper":"helper").
+      # It's gitignored, so CI must build it here or the app ships without it and
+      # TUN fails with "helper binary not found". Host-native build matches the
+      # `cargo tauri build` target below.
+      - name: Build TUN root helper (bundled into Resources/helper)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p quasar-helper --release
+          mkdir -p crates/tauri-app/resources/helper
+          case "${{ matrix.arch }}" in
+            windows-*) cp target/release/quasar-helper.exe crates/tauri-app/resources/helper/quasar-helper.exe ;;
+            *)         cp target/release/quasar-helper       crates/tauri-app/resources/helper/quasar-helper ;;
+          esac
+
       - name: Build app (installers + updater archives)
         run: cargo tauri build
 
