@@ -186,7 +186,14 @@ jobs:
         shell: bash
         env:
           QUASAR_APP_SLUG: ${{ inputs.slug }}
-        run: bash scripts/stage-helper.sh
+        run: |
+          # Universal macOS → build the helper as a fat arm64+x86_64 binary too,
+          # else TUN breaks on Intel (see stage-helper.sh). Other arches: host build.
+          if [ "${{ matrix.arch }}" = "darwin-universal" ]; then
+            bash scripts/stage-helper.sh universal-apple-darwin
+          else
+            bash scripts/stage-helper.sh
+          fi
 
       # macOS ships a UNIVERSAL binary (arm64 + x86_64) so one .pkg installs on
       # every Mac. universal-apple-darwin needs BOTH rust std targets present.
