@@ -75,7 +75,7 @@ jobs:
             t="$(echo "$t" | xargs)"   # trim whitespace
             case "$t" in
               windows) matrix=$(jq -c '. + [{"os":"windows-latest","arch":"windows-x86_64"}]' <<<"$matrix") ;;
-              macos)   matrix=$(jq -c '. + [{"os":"macos-14","arch":"darwin-aarch64"}]' <<<"$matrix") ;;
+              macos)   matrix=$(jq -c '. + [{"os":"macos-14","arch":"darwin-universal"}]' <<<"$matrix") ;;  # universal = arm64 + x86_64 fat binary, one pkg for every Mac
               linux)   matrix=$(jq -c '. + [{"os":"ubuntu-latest","arch":"linux-x86_64"}]' <<<"$matrix") ;;
               android|androidtv) android=true ;;
               *) echo "::warning::unknown target ignored: $t" ;;
@@ -169,6 +169,10 @@ jobs:
       - name: Fetch kernel binaries (bundled so a fresh install works offline —
               no first-run OTA download; OTA handles later upgrades)
         shell: bash
+        env:
+          # Universal macOS → lipo-merge both darwin arches of sing-box/xray into
+          # fat binaries so the one universal .app runs on Apple Silicon AND Intel.
+          MACOS_UNIVERSAL: ${{ matrix.arch == 'darwin-universal' && '1' || '0' }}
         run: bash scripts/fetch-kernels.sh crates/tauri-app/resources/kernels
 
       # The desktop TUN root helper (binary + macOS launchd plist) is bundled into
@@ -184,15 +188,32 @@ jobs:
           QUASAR_APP_SLUG: ${{ inputs.slug }}
         run: bash scripts/stage-helper.sh
 
+      # macOS ships a UNIVERSAL binary (arm64 + x86_64) so one .pkg installs on
+      # every Mac. universal-apple-darwin needs BOTH rust std targets present.
+      - name: Add macOS universal rust targets
+        if: matrix.arch == 'darwin-universal'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Build app (installers + updater archives)
-        run: cargo tauri build
+        shell: bash
+        run: |
+          if [ "${{ matrix.arch }}" = "darwin-universal" ]; then
+            cargo tauri build --target universal-apple-darwin
+          else
+            cargo tauri build
+          fi
 
       - name: Collect updater archive + installer
         id: collect
         shell: bash
         run: |
           set -euo pipefail
-          base="target/release/bundle"
+          # --target universal-apple-darwin nests the bundle under the target triple.
+          if [ "${{ matrix.arch }}" = "darwin-universal" ]; then
+            base="target/universal-apple-darwin/release/bundle"
+          else
+            base="target/release/bundle"
+          fi
           case "${{ matrix.arch }}" in
             linux-*)
               # Tauri 2 signs the AppImage directly (…AppImage + …AppImage.sig),
@@ -255,21 +276,29 @@ jobs:
         run: |
           set -euo pipefail
           bid="${{ inputs.build_id }}"; arch="${{ matrix.arch }}"
+          # A universal macOS build is ONE fat artifact that must be offered to
+          # BOTH darwin-aarch64 AND darwin-x86_64 clients: the Tauri updater/client
+          # reports the RUNNING arch, never "universal", so a lone darwin-universal
+          # manifest key matches nobody → macOS auto-update silently dead. Publish
+          # the SAME file under both real-arch keys (updater + installer).
+          if [ "$arch" = "darwin-universal" ]; then keys="darwin-aarch64 darwin-x86_64"; else keys="$arch"; fi
           # Single-part PUT (s3api put-object), NOT `aws s3 cp`: cp goes multipart
           # for files >8MB and R2 bucket-scoped tokens reject CreateMultipartUpload.
-          aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
-            --bucket "$STAGING_BUCKET" \
-            --key "$bid/updater/$arch/${{ steps.collect.outputs.updater_name }}" \
-            --body "${{ steps.collect.outputs.updater }}" >/dev/null
-          # Installer (direct download; not Tauri-signed).
-          if [ -n "${{ steps.collect.outputs.installer_name }}" ]; then
+          for k in $keys; do
             aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
               --bucket "$STAGING_BUCKET" \
-              --key "$bid/installer/$arch/${{ steps.collect.outputs.installer_name }}" \
-              --body "${{ steps.collect.outputs.installer }}" >/dev/null
-          else
-            echo "no installer bundle for $arch (check tauri.conf bundle targets)"
-          fi
+              --key "$bid/updater/$k/${{ steps.collect.outputs.updater_name }}" \
+              --body "${{ steps.collect.outputs.updater }}" >/dev/null
+            # Installer (direct download; not Tauri-signed).
+            if [ -n "${{ steps.collect.outputs.installer_name }}" ]; then
+              aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
+                --bucket "$STAGING_BUCKET" \
+                --key "$bid/installer/$k/${{ steps.collect.outputs.installer_name }}" \
+                --body "${{ steps.collect.outputs.installer }}" >/dev/null
+            else
+              echo "no installer bundle for $arch (check tauri.conf bundle targets)"
+            fi
+          done
           # Extra Linux formats under their own platform keys (empty on non-Linux).
           if [ -n "${{ steps.collect.outputs.deb_name }}" ]; then
             aws s3api put-object --endpoint-url "$R2_ENDPOINT" --bucket "$STAGING_BUCKET" \
