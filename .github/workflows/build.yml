@@ -264,9 +264,27 @@ jobs:
               inst="$RUNNER_TEMP/${appname}_${ver}_${a}.pkg"
               pkgbuild --install-location /Applications --component "$app" \
                        --identifier "$ident" --version "$ver" "$comp"
-              # productbuild wraps the component so Installer shows the standard
-              # wizard (介绍 / 目的宗卷 / 安装类型 / 安装 / 摘要).
-              productbuild --package "$comp" "$inst" ;;
+              # productbuild wraps the component into the standard installer wizard.
+              # Use an EXPLICIT distribution with hostArchitectures="arm64,x86_64" so
+              # the universal pkg installs on BOTH Apple Silicon and Intel — a bare
+              # `productbuild --package` can synthesize a distribution that restricts
+              # to the build arch (arm64), silently locking out Intel. The payload
+              # .app is a fat binary, so both arches also RUN. (printf, not heredoc —
+              # robust against YAML/case indentation.)
+              dist="$RUNNER_TEMP/distribution.xml"
+              printf '%s\n' \
+                '<?xml version="1.0" encoding="utf-8"?>' \
+                '<installer-gui-script minSpecVersion="2">' \
+                "  <title>${appname}</title>" \
+                '  <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>' \
+                '  <volume-check><allowed-os-versions><os-version min="11.0"/></allowed-os-versions></volume-check>' \
+                "  <choices-outline><line choice=\"default\"><line choice=\"${ident}\"/></line></choices-outline>" \
+                "  <choice id=\"default\" title=\"${appname}\"/>" \
+                "  <choice id=\"${ident}\" visible=\"false\" customLocation=\"/Applications/\"><pkg-ref id=\"${ident}\"/></choice>" \
+                "  <pkg-ref id=\"${ident}\" version=\"${ver}\" onConclusion=\"none\">component.pkg</pkg-ref>" \
+                '</installer-gui-script>' \
+                > "$dist"
+              productbuild --distribution "$dist" --package-path "$RUNNER_TEMP" "$inst" ;;
           esac
           echo "updater=$up" >> "$GITHUB_OUTPUT"
           echo "updater_name=$(basename "$up")" >> "$GITHUB_OUTPUT"
