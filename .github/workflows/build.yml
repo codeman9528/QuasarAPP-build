@@ -2,13 +2,19 @@
 # build.yml  —  lives in the PUBLIC repo:  codeman9528/QuasarAPP-build
 # Copy this file to that repo at  .github/workflows/build.yml
 #
-# Heavy, free compile of a branded Quasar client. NO signing key here at all.
-# Desktop needs none: the client has no self-updater, so nothing is signed —
-# users download the installer from the operator's own link. Only the Android
-# APK still needs a real key (the OS refuses an upgrade signed by anything else),
-# so the APK is left UNSIGNED here and sign.yml (private repo) signs just that.
-# Everything is uploaded to R2 staging under one $BUILD_ID/ prefix, then ONE
-# hand-off dispatches sign.yml.
+# One workflow, end to end: compile every selected platform, sign the Android
+# APK, collate the installer index, bundle it, hand it to R2, tell the console.
+#
+# Desktop needs no signing key at all — the client has no self-updater, so users
+# just download the installer from the link the operator publishes. The single
+# real key left is the Android release keystore (the OS refuses an upgrade signed
+# by a different key), and it lives here as a repo secret. This repo already
+# holds PRIVATE_REPO_DEPLOY_KEY, a strictly more valuable credential, so the
+# second (private) pipeline that used to exist purely to hold that keystore
+# bought no isolation while adding an R2 round-trip, a repository_dispatch and a
+# build-state machine that could drop a callback.
+#
+# Platform jobs stage into R2 under one $BUILD_ID/ prefix; `publish` fans them in.
 #
 # ── Single-workflow fan-in (ADR-013 + console targets) ───────────────────────
 # The console passes `targets` (windows,macos,linux,android,androidtv). A `setup`
@@ -62,6 +68,10 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_STAGING_SECRET }}
   AWS_DEFAULT_REGION:    auto
   STAGING_BUCKET:        ${{ vars.STAGING_BUCKET }}         # e.g. quasar-staging
+  # aws cli v2.23+ computes CRC checksums that Cloudflare R2 rejects (401).
+  # Force the legacy behaviour for EVERY aws call in this file.
+  AWS_REQUEST_CHECKSUM_CALCULATION:  when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION:  when_required
 
 jobs:
   # ── Plan which platform jobs run, from the console's `targets` list ──────────
@@ -307,11 +317,6 @@ jobs:
 
       - name: Upload installer to R2 staging
         shell: bash
-        env:
-          # Force legacy checksum behavior — aws cli v2.23+ CRC checksums make
-          # Cloudflare R2 reject the request (401 Unauthorized).
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
           set -euo pipefail
           bid="$BUILD_ID"; arch="${{ matrix.arch }}"
@@ -494,9 +499,6 @@ jobs:
 
       - name: Upload UNSIGNED APK to R2 staging (installer/android-universal)
         shell: bash
-        env:
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
           set -euo pipefail
           aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
@@ -513,31 +515,219 @@ jobs:
       # staging bucket instead.
 
   # ── Fan-in: dispatch sign.yml ONCE after all selected builds succeed ─────────
-  handoff:
+  # ── Fan-in: sign the APK, collate, bundle, deliver, tell the console ────────
+  #
+  # Everything used to be dispatched to a SECOND workflow in the private repo,
+  # purely because that's where the signing keys lived. The desktop client no
+  # longer self-updates, so desktop needs no key at all, and the only key left is
+  # the Android release keystore — which lives here as a repo secret, exactly as
+  # this repo already holds PRIVATE_REPO_DEPLOY_KEY (a strictly more valuable
+  # credential). Keeping a whole second pipeline for it bought no real isolation
+  # while adding an R2 round-trip, a repository_dispatch, and a build-state
+  # machine that could lose a callback.
+  publish:
     needs: [setup, compile, android]
-    # Run when nothing FAILED and at least one build job actually produced output.
-    # (compile/android are 'skipped' when their platform wasn't selected — fine.)
-    # Partial success: hand off as long as the run wasn't cancelled and setup
-    # produced a plan — even if SOME platforms failed. sign.yml publishes whatever
-    # actually staged (it tolerates missing platforms) and its own guard fails the
-    # sign job if NOTHING staged (all platforms failed → build reported failed).
-    # (With fail-fast:false a partial failure leaves compile.result == 'failure'
-    # while successful legs still staged, which the old gate wrongly blocked.)
+    # Partial success: publish whatever actually staged, as long as the run wasn't
+    # cancelled and setup produced a plan — even if SOME platforms failed.
+    # (fail-fast:false leaves compile.result == 'failure' while the successful
+    # legs still staged.) The "nothing staged" case is caught below and fails the
+    # job so the console hears 'failed' instead of a false 'published'.
     if: >-
       ${{ !cancelled() && needs.setup.result == 'success'
           && (needs.compile.result != 'skipped' || needs.android.result != 'skipped') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest          # MUST be Linux (1x multiplier) — never mac/win.
+    env:
+      # Only used to READ the unsigned artifacts back from the staging bucket and
+      # to write the finished bundle there. There is NO release-OSS upload:
+      # quasar-publish runs --local-only and the operator downloads the bundle
+      # through the console to publish on their own OSS.
+      NOTES: ${{ inputs.notes }}
     steps:
-      - name: Dispatch private sign.yml (once, for all built platforms)
-        uses: peter-evans/repository-dispatch@v3
+      # The private source is needed for quasar-publish + brands/<slug>/brand.yaml
+      # + the release-readme template.
+      - name: Checkout PRIVATE source (read-only deploy key)
+        uses: actions/checkout@v4
         with:
-          token: ${{ secrets.PRIVATE_DISPATCH_TOKEN }}   # fine-grained PAT: dispatch on codeman9528/QuasarAPP
           repository: codeman9528/QuasarAPP
-          event-type: brand-build-signed
-          client-payload: |
-            {
-              "build_id": ${{ toJSON(inputs.build_id) }},
-              "slug": ${{ toJSON(inputs.slug) }},
-              "version": ${{ toJSON(inputs.version) }},
-              "notes": ${{ toJSON(inputs.notes) }}
-            }
+          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+
+      # Rust is needed only to build+run quasar-publish (small, and rust-cache'd).
+      # 1.88 (matches rust-toolchain.toml): a transitive dep of rust-s3
+      # (idna_adapter, edition 2024) no longer parses on 1.82's cargo.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Pull staged artifacts from R2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          aws s3 cp --endpoint-url "$R2_ENDPOINT" --recursive \
+            "s3://$STAGING_BUCKET/$BUILD_ID/" staging/
+
+      - name: Detect staged Android APK
+        id: apk
+        shell: bash
+        run: |
+          apk="$(find staging/installer -name '*.apk' 2>/dev/null | head -1 || true)"
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+          if [ -n "$apk" ]; then echo "found=true" >> "$GITHUB_OUTPUT"; else echo "found=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Set up JDK for apksigner
+        if: steps.apk.outputs.found == 'true'
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - name: Set up Android build-tools (zipalign + apksigner)
+        if: steps.apk.outputs.found == 'true'
+        uses: android-actions/setup-android@v3
+      - name: Install build-tools
+        if: steps.apk.outputs.found == 'true'
+        run: sdkmanager "build-tools;34.0.0"
+
+      # The one real key in the whole pipeline. Android refuses to install an
+      # upgrade signed by a different key than the installed app, so this must be
+      # STABLE across releases — a rotated key forces every user to uninstall
+      # (losing their data) before they can update.
+      - name: Sign the Android APK with the release keystore
+        if: steps.apk.outputs.found == 'true'
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64:   ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS:         ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD:      ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          apk="${{ steps.apk.outputs.path }}"
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "::error::APK staged but ANDROID_KEYSTORE_BASE64 secret is unset — cannot ship an unsigned APK"
+            exit 1
+          fi
+          signed="${apk%-unsigned.apk}"; [ "$signed" = "$apk" ] && signed="${apk%.apk}-signed"; signed="${signed}.apk"
+          scripts/android-sign-apk.sh "$apk" "$signed"
+          # Drop the unsigned APK so the installers step publishes only the signed one.
+          [ "$signed" != "$apk" ] && rm -f "$apk" || true
+
+      - name: Collate installers → installers.json (local, no upload)
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -d staging/installer ]; then
+            for dir in staging/installer/*/; do
+              arch="$(basename "$dir")"
+              f="$(ls "$dir"* 2>/dev/null | head -1 || true)"
+              [ -n "$f" ] && args+=( --platform "$arch=$f" )
+            done
+          fi
+          if [ ${#args[@]} -gt 0 ]; then
+            cargo run -p quasar-publish -- installers \
+              --brand "brands/$SLUG/brand.yaml" \
+              --version "$VERSION" \
+              --notes "$NOTES" \
+              --local-only \
+              "${args[@]}"
+          else
+            echo "no installers staged; skipping installers.json"
+          fi
+
+      # If EVERY platform failed, nothing staged → no index was collated. Fail here
+      # so the failure callback fires (build → failed) instead of publishing an
+      # empty release and reporting a false "published".
+      - name: Fail if nothing was built (all platforms failed)
+        run: |
+          if [ ! -f dist/publish/installers.json ]; then
+            echo "::error::no platform produced an installer — nothing to publish"
+            exit 1
+          fi
+
+      - name: Bundle release for operator download
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-bundle
+          cp -rf dist/publish/. release-bundle/ 2>/dev/null || true
+          # Installer packages, flattened.
+          find staging -type f \
+            \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+               -o -name '*.exe' -o -name '*.msi' \
+               -o -name '*.pkg' -o -name '*.dmg' -o -name '*.apk' \) \
+            -exec cp -f {} release-bundle/ \; 2>/dev/null || true
+          # Operator-facing guide (what each artifact is + how to publish). Kept as
+          # a tracked template so it's not an unwieldy YAML heredoc. Substitute the
+          # brand slug + version AND the operator's OWN configured directories
+          # (read from brands/<slug>/brand.yaml) so it names the exact URLs they
+          # upload to, not a placeholder.
+          BRAND="brands/${SLUG}/brand.yaml"
+          UPDATE_BASE=$(grep -m1 -E '^[[:space:]]*update_base_url:' "$BRAND" 2>/dev/null \
+            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')
+          # config.bin lives at the first fetch_mirrors entry, else update_base_url.
+          CONFIG_BASE=$(awk '/^[[:space:]]*fetch_mirrors:/{f=1;next} f&&/^[[:space:]]*-/{gsub(/^[[:space:]]*-[[:space:]]*"?|"?[[:space:]]*$/,"");print;exit} f&&/^[[:space:]]*[a-z_]+:/{exit}' "$BRAND" 2>/dev/null)
+          [ -n "$UPDATE_BASE" ] || UPDATE_BASE="（见 console 品牌里填的「软件更新源」）"
+          [ -n "$CONFIG_BASE" ] || CONFIG_BASE="$UPDATE_BASE"
+          # Use a non-/ sed delimiter (URLs contain /).
+          sed -e "s#__SLUG__#${SLUG}#g" -e "s#__VERSION__#${VERSION}#g" \
+              -e "s#__UPDATE_BASE__#${UPDATE_BASE}#g" -e "s#__CONFIG_BASE__#${CONFIG_BASE}#g" \
+            docs/build-farm/release-readme.txt > "release-bundle/发布说明.txt" 2>/dev/null || true
+          # Build provenance — appended to the BOTTOM of 发布说明.txt. build_id is
+          # unique per console build and is ALSO baked into the binary (设置→关于
+          # shows the same #id + time), so a stale same-version zip is caught by
+          # cross-checking these two. Directly answers "这个包到底新不新".
+          {
+            echo ""
+            echo "======================================================================"
+            echo "构建信息 —— 用于核对这个包是不是最新的"
+            echo "──────────────────────────────────────────────"
+            echo "品牌:      ${SLUG}"
+            echo "版本:      ${VERSION}"
+            echo "构建ID:    ${BUILD_ID}"
+            echo "打包时间:  $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "构建运行:  ${{ github.run_id }}"
+            echo ""
+            echo "核对方法:装好后打开 App → 设置 → 关于,那里的「#构建ID」应与上面一致。"
+            echo "不一致 = 你装的不是这个包(拿到旧包/装错了)。"
+          } >> "release-bundle/发布说明.txt"
+          # End-user-facing macOS install guide (brand-agnostic → plain copy).
+          # Operator forwards it to Mac users so the un-notarized pkg's Gatekeeper
+          # prompt doesn't read as "broken".
+          cp -f docs/build-farm/macos-install.txt "release-bundle/macOS安装说明.txt" 2>/dev/null || true
+          ls -la release-bundle
+
+      # Deliver via R2, NOT a GitHub artifact: each bundle is ~350MB, a free
+      # account has only 500MB of shared Actions storage, and artifacts in a PUBLIC
+      # repo are downloadable by anyone. The console pulls this object and proxies
+      # it to the operator; the staging bucket's 1-day lifecycle cleans up.
+      - name: Upload bundle to R2 (console downloads from here)
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ( cd release-bundle && zip -r -q ../release.zip . )
+          aws s3 cp --endpoint-url "$R2_ENDPOINT" release.zip \
+            "s3://$STAGING_BUCKET/$BUILD_ID/signed/release.zip"
+          echo "→ s3://$STAGING_BUCKET/$BUILD_ID/signed/release.zip ($(du -h release.zip | cut -f1))"
+
+      - name: Callback orchestrator — success (HMAC-signed)
+        if: success()
+        shell: bash
+        run: |
+          body="{\"build_id\":\"$BUILD_ID\",\"slug\":\"$SLUG\",\"version\":\"$VERSION\",\"status\":\"published\",\"run_id\":${{ github.run_id }}}"
+          sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "${{ secrets.CALLBACK_HMAC_SECRET }}" | awk '{print $2}')
+          # Strip any stray whitespace/newline from the secret — a trailing \n in
+          # ORCHESTRATOR_CALLBACK_URL makes curl reject it ("Malformed input to a
+          # URL function") and, being -fsS on the success path, fails the whole
+          # (already-succeeded) job.
+          url=$(printf '%s' "${{ secrets.ORCHESTRATOR_CALLBACK_URL }}" | tr -d '[:space:]')
+          curl -fsS -X POST "$url" \
+            -H "content-type: application/json" -H "x-signature: sha256=$sig" --data "$body"
+
+      - name: Callback orchestrator — failure
+        if: failure()
+        shell: bash
+        run: |
+          body="{\"build_id\":\"$BUILD_ID\",\"slug\":\"$SLUG\",\"version\":\"$VERSION\",\"status\":\"failed\",\"run_url\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+          sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "${{ secrets.CALLBACK_HMAC_SECRET }}" | awk '{print $2}')
+          url=$(printf '%s' "${{ secrets.ORCHESTRATOR_CALLBACK_URL }}" | tr -d '[:space:]')
+          curl -fsS -X POST "$url" \
+            -H "content-type: application/json" -H "x-signature: sha256=$sig" --data "$body" || true
