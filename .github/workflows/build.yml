@@ -163,7 +163,15 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm -C apps/ui build
 
+      # shell: bash is LOAD-BEARING. Without it this step runs under PowerShell on
+      # windows-latest, where `$SLUG` is an undefined PowerShell variable (env vars
+      # are `$env:SLUG`) — it expands to empty and the path becomes
+      # `brands//brand.yaml`. POSIX collapses the double slash so linux/macos never
+      # noticed; Windows does not, so every Windows build failed here with
+      # "The system cannot find the file specified" and the release shipped with no
+      # Windows package at all. Every neighbouring step already sets it.
       - name: Apply brand (patches tauri.conf.json + icons + .cargo env)
+        shell: bash
         run: cargo run -p quasar-builder -- apply --brand "brands/$SLUG/brand.yaml"
 
       - name: Regenerate icon set from brand icon.png (if the console uploaded one)
@@ -216,6 +224,19 @@ jobs:
       - name: Add macOS universal rust targets
         if: matrix.arch == 'darwin-universal'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      # Swatinem/rust-cache keys on the job + Cargo.lock, NOT on the brand, so
+      # `target/` is shared across every brand this farm builds — and bundle
+      # output survives in it. The macOS collect step then globs
+      # `bundle/macos/*.app` and takes the first hit, which sorts by BYTES: an
+      # ASCII name like `SeaGullFast.app` comes before a Chinese one like
+      # `赢速网络.app`. So a build could pick up the PREVIOUS brand's app.
+      # Observed as a pkgbuild "not a valid bundle component" failure, but the
+      # dangerous case is the quiet one — a complete stale app would have been
+      # signed and shipped as this brand's release.
+      - name: Purge stale bundle output from earlier brands
+        shell: bash
+        run: rm -rf target/*/release/bundle target/release/bundle
 
       - name: Build app (installers)
         shell: bash
