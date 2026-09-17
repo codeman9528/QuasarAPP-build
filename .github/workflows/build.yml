@@ -421,6 +421,12 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        # The action's default is "tools platform-tools"; Google removed the
+        # legacy `tools` package from the SDK repository, so sdkmanager exits 1
+        # ("Failed to find package 'tools'") and the job dies here. Nothing in
+        # this build uses `tools` (cmdline-tools ships with the action).
+        with:
+          packages: platform-tools
       - name: Install NDK + platform + build-tools
         run: sdkmanager "ndk;28.0.13004108" "platforms;android-34" "build-tools;34.0.0"
 
@@ -640,6 +646,12 @@ jobs:
       - name: Set up Android build-tools (zipalign + apksigner)
         if: steps.apk.outputs.found == 'true'
         uses: android-actions/setup-android@v3
+        # The action's default is "tools platform-tools"; Google removed the
+        # legacy `tools` package from the SDK repository, so sdkmanager exits 1
+        # ("Failed to find package 'tools'") and the job dies here. Nothing in
+        # this build uses `tools` (cmdline-tools ships with the action).
+        with:
+          packages: platform-tools
       - name: Install build-tools
         if: steps.apk.outputs.found == 'true'
         run: sdkmanager "build-tools;34.0.0"
