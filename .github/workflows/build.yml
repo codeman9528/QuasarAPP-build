@@ -62,6 +62,10 @@ env:
   VERSION:  ${{ inputs.version }}
   BUILD_ID: ${{ inputs.build_id }}
   TARGETS:  ${{ inputs.targets }}
+  # Baked into the client (crates/tauri-app/build.rs → 设置 → 关于 shows
+  # "#<first 8>"). Without it every farm build read "local · 本地构建", so the
+  # 发布说明 instruction "compare the build ID" could never match.
+  QUASAR_BUILD_ID: ${{ inputs.build_id }}
   # R2 staging endpoint + WRITE-ONLY-to-staging token (leak = throwaway bucket only).
   R2_ENDPOINT:           ${{ vars.R2_ENDPOINT }}            # https://<acct>.r2.cloudflarestorage.com
   AWS_ACCESS_KEY_ID:     ${{ secrets.R2_STAGING_KEY_ID }}
@@ -80,6 +84,9 @@ jobs:
     outputs:
       desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
       build_android:  ${{ steps.plan.outputs.build_android }}
+      # ONE timestamp for the whole run: every platform binary and the zip's
+      # 发布说明 show the same value.
+      build_time:     ${{ steps.plan.outputs.build_time }}
     steps:
       - name: Plan jobs from targets
         id: plan
@@ -106,6 +113,7 @@ jobs:
           done
           echo "desktop_matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "build_android=$android" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M') (UTC+8)" >> "$GITHUB_OUTPUT"
           echo "· plan: desktop=$matrix  android=$android" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # ── Desktop compile (one job per selected desktop arch) ──────────────────────
@@ -119,6 +127,8 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.setup.outputs.desktop_matrix) }}
     runs-on: ${{ matrix.os }}
+    env:
+      QUASAR_BUILD_TIME: ${{ needs.setup.outputs.build_time }}
     steps:
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@v4
@@ -397,6 +407,8 @@ jobs:
     needs: setup
     if: ${{ needs.setup.outputs.build_android == 'true' }}
     runs-on: ubuntu-latest
+    env:
+      QUASAR_BUILD_TIME: ${{ needs.setup.outputs.build_time }}
     steps:
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@v4
@@ -740,11 +752,11 @@ jobs:
             echo "──────────────────────────────────────────────"
             echo "品牌:      ${SLUG}"
             echo "版本:      ${VERSION}"
-            echo "构建ID:    ${BUILD_ID}"
-            echo "打包时间:  $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "构建ID:    #${BUILD_ID:0:8}    (完整 ${BUILD_ID})"
+            echo "构建时间:  ${{ needs.setup.outputs.build_time }}"
             echo "构建运行:  ${{ github.run_id }}"
             echo ""
-            echo "核对方法:装好后打开 App → 设置 → 关于,那里的「#构建ID」应与上面一致。"
+            echo "核对方法:装好后打开 App → 设置 → 关于,版本号后面的「#xxxxxxxx」和时间应与上面一致。"
             echo "不一致 = 你装的不是这个包(拿到旧包/装错了)。"
           } >> "release-bundle/发布说明.txt"
           # End-user-facing macOS install guide (brand-agnostic → plain copy).
