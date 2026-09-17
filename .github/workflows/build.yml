@@ -95,7 +95,11 @@ jobs:
             case "$t" in
               windows) matrix=$(jq -c '. + [{"os":"windows-latest","arch":"windows-x86_64"}]' <<<"$matrix") ;;
               macos)   matrix=$(jq -c '. + [{"os":"macos-14","arch":"darwin-universal"}]' <<<"$matrix") ;;  # universal = arm64 + x86_64 fat binary, one pkg for every Mac
-              linux)   matrix=$(jq -c '. + [{"os":"ubuntu-latest","arch":"linux-x86_64"}]' <<<"$matrix") ;;
+              # ubuntu-22.04, NOT ubuntu-latest: the runner's glibc becomes the
+              # binary's minimum, and `latest` moves under us (24.04 = glibc 2.39,
+              # which will not run on Ubuntu 22.04 LTS or Debian 12 — both still
+              # supported). packaging/linux/README promises glibc >= 2.31.
+              linux)   matrix=$(jq -c '. + [{"os":"ubuntu-22.04","arch":"linux-x86_64"}]' <<<"$matrix") ;;
               android|androidtv) android=true ;;
               *) echo "::warning::unknown target ignored: $t" ;;
             esac
@@ -135,7 +139,7 @@ jobs:
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Linux build deps
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu-')
         run: |
           sudo apt-get update
           # `rpm` provides rpmbuild — without it Tauri silently skips the .rpm
@@ -477,7 +481,12 @@ jobs:
           fi
 
       - name: Fetch geo databases (bundled into the apk assets)
-        run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo || echo "geo fetch failed (non-fatal)"
+        # MUST be fatal. Without a local geo bundle the emitter falls back to
+        # `type: remote` rule-sets fetched from a third-party CDN over
+        # `download_detour: direct`, and sing-box's RemoteRuleSet has no
+        # integrity field — a poisoned geoip-cn.srs routes everything to
+        # `direct` while the UI still says connected.
+        run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo
 
       # White-label identity split: Kotlin package + JNI exports are hardcoded
       # io.quasar.app, so the android CODE identity must stay io.quasar.app.
@@ -687,7 +696,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-bundle
-          cp -rf dist/publish/. release-bundle/ 2>/dev/null || true
+          # dist/publish is NOT copied in. In --local-only mode it holds exactly one
+          # file, installers.json, which nothing reads any more: the client never
+          # did, and the console's per-platform artifact list that did has been
+          # removed. It stays on disk only as the "did any platform build"
+          # sentinel checked in the step above. Shipping it just made operators
+          # upload a file with no effect.
           # Installer packages, flattened.
           find staging -type f \
             \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
@@ -710,6 +724,11 @@ jobs:
           sed -e "s#__SLUG__#${SLUG}#g" -e "s#__VERSION__#${VERSION}#g" \
               -e "s#__UPDATE_BASE__#${UPDATE_BASE}#g" -e "s#__CONFIG_BASE__#${CONFIG_BASE}#g" \
             docs/build-farm/release-readme.txt > "release-bundle/发布说明.txt" 2>/dev/null || true
+          # GPLv3 §6 expects the notices to travel WITH the binaries, and the
+          # operator — not us — is the one distributing them, so the file has to
+          # be in the zip they receive. The client also carries an offline copy
+          # (设置 → 关于 → 开源许可) for the end user.
+          cp THIRD-PARTY-NOTICES.md "release-bundle/THIRD-PARTY-NOTICES.md"
           # Build provenance — appended to the BOTTOM of 发布说明.txt. build_id is
           # unique per console build and is ALSO baked into the binary (设置→关于
           # shows the same #id + time), so a stale same-version zip is caught by
