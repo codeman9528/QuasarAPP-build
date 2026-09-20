@@ -911,14 +911,15 @@ jobs:
         if: success()
         shell: bash
         run: |
-          body="{\"build_id\":\"$BUILD_ID\",\"slug\":\"$SLUG\",\"version\":\"$VERSION\",\"status\":\"published\",\"run_id\":${{ github.run_id }}}"
+          built="$(ls -1 staging/installer 2>/dev/null | paste -sd, - || true)"
+          body="{\"build_id\":\"$BUILD_ID\",\"slug\":\"$SLUG\",\"version\":\"$VERSION\",\"status\":\"published\",\"run_id\":${{ github.run_id }},\"built\":\"$built\"}"
           sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "${{ secrets.CALLBACK_HMAC_SECRET }}" | awk '{print $2}')
           # Strip any stray whitespace/newline from the secret — a trailing \n in
           # ORCHESTRATOR_CALLBACK_URL makes curl reject it ("Malformed input to a
           # URL function") and, being -fsS on the success path, fails the whole
           # (already-succeeded) job.
           url=$(printf '%s' "${{ secrets.ORCHESTRATOR_CALLBACK_URL }}" | tr -d '[:space:]')
-          curl -fsS -X POST "$url" \
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors -X POST "$url" \
             -H "content-type: application/json" -H "x-signature: sha256=$sig" --data "$body"
 
       - name: Callback orchestrator — failure
@@ -928,5 +929,5 @@ jobs:
           body="{\"build_id\":\"$BUILD_ID\",\"slug\":\"$SLUG\",\"version\":\"$VERSION\",\"status\":\"failed\",\"run_url\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
           sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "${{ secrets.CALLBACK_HMAC_SECRET }}" | awk '{print $2}')
           url=$(printf '%s' "${{ secrets.ORCHESTRATOR_CALLBACK_URL }}" | tr -d '[:space:]')
-          curl -fsS -X POST "$url" \
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors -X POST "$url" \
             -H "content-type: application/json" -H "x-signature: sha256=$sig" --data "$body" || true
