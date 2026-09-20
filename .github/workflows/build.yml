@@ -58,20 +58,22 @@ concurrency:
 # sign.yml signs them. (The console also rejects such versions; this is the
 # second layer.) Passing them through `env:` keeps them as inert data.
 env:
-  SLUG:     ${{ inputs.slug }}
-  VERSION:  ${{ inputs.version }}
-  BUILD_ID: ${{ inputs.build_id }}
-  TARGETS:  ${{ inputs.targets }}
-  # Baked into the client (crates/tauri-app/build.rs → 设置 → 关于 shows
-  # "#<first 8>"). Without it every farm build read "local · 本地构建", so the
-  # 发布说明 instruction "compare the build ID" could never match.
-  QUASAR_BUILD_ID: ${{ inputs.build_id }}
+  # SLUG / VERSION / BUILD_ID / TARGETS / QUASAR_BUILD_ID are NOT set here. This
+  # repository is PUBLIC and Actions prints every step's env block: with them at
+  # workflow level, anyone could read the full customer list (brand slugs), each
+  # brand's release cadence and every build id straight off the Actions tab. The
+  # first step of every job ("Load inputs (masked)") reads them from the event
+  # payload, registers slug + build id as masks, THEN exports them — so every
+  # later env block and log line shows `***`.
   # R2 staging endpoint + WRITE-ONLY-to-staging token (leak = throwaway bucket only).
-  R2_ENDPOINT:           ${{ vars.R2_ENDPOINT }}            # https://<acct>.r2.cloudflarestorage.com
+  # secrets, not vars: a var is printed in clear (account id + bucket name).
+  R2_ENDPOINT:           ${{ secrets.R2_ENDPOINT }}         # https://<acct>.r2.cloudflarestorage.com
   AWS_ACCESS_KEY_ID:     ${{ secrets.R2_STAGING_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_STAGING_SECRET }}
   AWS_DEFAULT_REGION:    auto
-  STAGING_BUCKET:        ${{ vars.STAGING_BUCKET }}         # e.g. quasar-staging
+  # rustc warnings quote source lines; in a public log that is private code.
+  RUSTFLAGS: -Awarnings
+  STAGING_BUCKET:        ${{ secrets.STAGING_BUCKET }}      # e.g. quasar-staging
   # aws cli v2.23+ computes CRC checksums that Cloudflare R2 rejects (401).
   # Force the legacy behaviour for EVERY aws call in this file.
   AWS_REQUEST_CHECKSUM_CALCULATION:  when_required
@@ -88,6 +90,21 @@ jobs:
       # 发布说明 show the same value.
       build_time:     ${{ steps.plan.outputs.build_time }}
     steps:
+      - name: Load inputs (masked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
+          slug="$(inp slug)"; bid="$(inp build_id)"
+          [ -n "$slug" ] && echo "::add-mask::$slug"
+          [ -n "$bid" ]  && echo "::add-mask::$bid" && echo "::add-mask::${bid:0:8}"
+          {
+            echo "SLUG=$slug"
+            echo "VERSION=$(inp version)"
+            echo "BUILD_ID=$bid"
+            echo "QUASAR_BUILD_ID=$bid"
+            echo "TARGETS=$(inp targets)"
+          } >> "$GITHUB_ENV"
       - name: Plan jobs from targets
         id: plan
         shell: bash
@@ -130,6 +147,21 @@ jobs:
     env:
       QUASAR_BUILD_TIME: ${{ needs.setup.outputs.build_time }}
     steps:
+      - name: Load inputs (masked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
+          slug="$(inp slug)"; bid="$(inp build_id)"
+          [ -n "$slug" ] && echo "::add-mask::$slug"
+          [ -n "$bid" ]  && echo "::add-mask::$bid" && echo "::add-mask::${bid:0:8}"
+          {
+            echo "SLUG=$slug"
+            echo "VERSION=$(inp version)"
+            echo "BUILD_ID=$bid"
+            echo "QUASAR_BUILD_ID=$bid"
+            echo "TARGETS=$(inp targets)"
+          } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@v4
         with:
@@ -138,6 +170,21 @@ jobs:
 
       # Builds float to main HEAD (no per-build ref pin), so record the exact
       # commit that produced this artifact — provenance + reproducibility.
+      - name: Mask brand identity in logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="brands/$SLUG/brand.yaml"
+          [ -f "$f" ] || exit 0
+          # name / identifier / window_title / the brand's own hosts: all of it
+          # identifies the customer, and builder + tauri print them.
+          grep -E '^[[:space:]]*(name|identifier|window_title|panel_base|update_base_url|public_url_base):' "$f" \
+            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
+            | while IFS= read -r v; do
+                [ ${#v} -ge 2 ] && echo "::add-mask::$v"
+                host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
+                [ -n "$host" ] && echo "::add-mask::$host"
+              done || true
       - name: Record source commit
         id: src
         shell: bash
@@ -145,7 +192,7 @@ jobs:
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "· built $SLUG v$VERSION ${{ matrix.arch }} from private@$sha" \
+          echo "· built v$VERSION ${{ matrix.arch }} from private@${sha:0:9}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Linux build deps
@@ -410,12 +457,42 @@ jobs:
     env:
       QUASAR_BUILD_TIME: ${{ needs.setup.outputs.build_time }}
     steps:
+      - name: Load inputs (masked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
+          slug="$(inp slug)"; bid="$(inp build_id)"
+          [ -n "$slug" ] && echo "::add-mask::$slug"
+          [ -n "$bid" ]  && echo "::add-mask::$bid" && echo "::add-mask::${bid:0:8}"
+          {
+            echo "SLUG=$slug"
+            echo "VERSION=$(inp version)"
+            echo "BUILD_ID=$bid"
+            echo "QUASAR_BUILD_ID=$bid"
+            echo "TARGETS=$(inp targets)"
+          } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@v4
         with:
           repository: codeman9528/QuasarAPP
           ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
 
+      - name: Mask brand identity in logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="brands/$SLUG/brand.yaml"
+          [ -f "$f" ] || exit 0
+          # name / identifier / window_title / the brand's own hosts: all of it
+          # identifies the customer, and builder + tauri print them.
+          grep -E '^[[:space:]]*(name|identifier|window_title|panel_base|update_base_url|public_url_base):' "$f" \
+            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
+            | while IFS= read -r v; do
+                [ ${#v} -ge 2 ] && echo "::add-mask::$v"
+                host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
+                [ -n "$host" ] && echo "::add-mask::$host"
+              done || true
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "17" }
 
@@ -560,7 +637,8 @@ jobs:
           apk="$(dirname "$apk")/$newname"
           echo "apk=$apk" >> "$GITHUB_OUTPUT"
           echo "name=$newname" >> "$GITHUB_OUTPUT"
-          echo "· built $apk" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "· built $apk"
+          echo "· built android apk" >> "$GITHUB_STEP_SUMMARY"   # summaries are public and unmasked
 
       - name: Upload UNSIGNED APK to R2 staging (installer/android-universal)
         shell: bash
@@ -613,6 +691,21 @@ jobs:
     steps:
       # The private source is needed for quasar-publish + brands/<slug>/brand.yaml
       # + the release-readme template.
+      - name: Load inputs (masked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
+          slug="$(inp slug)"; bid="$(inp build_id)"
+          [ -n "$slug" ] && echo "::add-mask::$slug"
+          [ -n "$bid" ]  && echo "::add-mask::$bid" && echo "::add-mask::${bid:0:8}"
+          {
+            echo "SLUG=$slug"
+            echo "VERSION=$(inp version)"
+            echo "BUILD_ID=$bid"
+            echo "QUASAR_BUILD_ID=$bid"
+            echo "TARGETS=$(inp targets)"
+          } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@v4
         with:
@@ -620,6 +713,21 @@ jobs:
           ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
 
       # Rust is needed only to build+run quasar-publish (small, and rust-cache'd).
+      - name: Mask brand identity in logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="brands/$SLUG/brand.yaml"
+          [ -f "$f" ] || exit 0
+          # name / identifier / window_title / the brand's own hosts: all of it
+          # identifies the customer, and builder + tauri print them.
+          grep -E '^[[:space:]]*(name|identifier|window_title|panel_base|update_base_url|public_url_base):' "$f" \
+            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
+            | while IFS= read -r v; do
+                [ ${#v} -ge 2 ] && echo "::add-mask::$v"
+                host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
+                [ -n "$host" ] && echo "::add-mask::$host"
+              done || true
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
 
@@ -744,10 +852,18 @@ jobs:
           CONFIG_BASE=$(awk '/^[[:space:]]*fetch_mirrors:/{f=1;next} f&&/^[[:space:]]*-/{gsub(/^[[:space:]]*-[[:space:]]*"?|"?[[:space:]]*$/,"");print;exit} f&&/^[[:space:]]*[a-z_]+:/{exit}' "$BRAND" 2>/dev/null)
           [ -n "$UPDATE_BASE" ] || UPDATE_BASE="（见 console 品牌里填的「软件更新源」）"
           [ -n "$CONFIG_BASE" ] || CONFIG_BASE="$UPDATE_BASE"
-          # Use a non-/ sed delimiter (URLs contain /).
-          sed -e "s#__SLUG__#${SLUG}#g" -e "s#__VERSION__#${VERSION}#g" \
-              -e "s#__UPDATE_BASE__#${UPDATE_BASE}#g" -e "s#__CONFIG_BASE__#${CONFIG_BASE}#g" \
-            docs/build-farm/release-readme.txt > "release-bundle/发布说明.txt" 2>/dev/null || true
+          # Literal substitution, NOT sed: these values come from a tenant's brand
+          # form, and inside `s#…#<value>#` a `#` ends the expression — after
+          # which GNU sed will happily run `w <file>` / `r <file>` on this runner
+          # (which holds the deploy key and the R2 credentials).
+          SLUG="$SLUG" VERSION="$VERSION" UPDATE_BASE="$UPDATE_BASE" CONFIG_BASE="$CONFIG_BASE" \
+          python3 - docs/build-farm/release-readme.txt "release-bundle/发布说明.txt" <<'PYEOF' || true
+          import os, sys
+          t = open(sys.argv[1], encoding="utf-8").read()
+          for k in ("SLUG", "VERSION", "UPDATE_BASE", "CONFIG_BASE"):
+              t = t.replace(f"__{k}__", os.environ.get(k, ""))
+          open(sys.argv[2], "w", encoding="utf-8").write(t)
+          PYEOF
           # GPLv3 §6 expects the notices to travel WITH the binaries, and the
           # operator — not us — is the one distributing them, so the file has to
           # be in the zip they receive. The client also carries an offline copy
