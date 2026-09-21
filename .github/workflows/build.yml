@@ -32,7 +32,11 @@
 #    build-android.yml is KEPT as a manual android-only escape hatch; the console
 #    path is THIS file. Do not run both for one build_id (double sign dispatch).
 #
-# NOTE: pin every third-party action to a commit SHA before production.
+# Every `uses:` is pinned to a commit SHA (the tag follows in a comment). A tag
+# is mutable: whoever can move `v4` can run their code on a runner that holds
+# the private-repo deploy key, the Android keystore and the R2 staging
+# credentials. Re-pin deliberately when upgrading — `scripts/pin-actions.sh`
+# resolves the current SHAs.
 # =============================================================================
 name: build
 
@@ -44,6 +48,13 @@ on:
       build_id:  { description: "orchestrator build id (echoed back in the dispatch)", required: true }
       notes:     { description: "更新内容 (release notes, shown in the client update dialog)", required: false, default: "" }
       targets:   { description: "comma-separated platforms: windows,macos,linux,android,androidtv (blank = all)", required: false, default: "" }
+      # The console resolves the private repo's branch to a commit before it
+      # dispatches, so every job of a build compiles the SAME source. Without it
+      # each job checked out main HEAD independently: a push landing mid-build
+      # produced one "version" whose Windows and Android halves were different
+      # code, and a rebuild of a shipped version was not reproducible.
+      # Blank (an old dispatch, or a manual one) → the default branch, as before.
+      source_sha: { description: "private-repo commit to build (blank = default branch HEAD)", required: false, default: "" }
 
 concurrency:
   group: build-${{ inputs.slug }}-${{ inputs.version }}
@@ -104,6 +115,7 @@ jobs:
             echo "BUILD_ID=$bid"
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
+            echo "SOURCE_SHA=$(inp source_sha)"
           } >> "$GITHUB_ENV"
       - name: Plan jobs from targets
         id: plan
@@ -161,12 +173,16 @@ jobs:
             echo "BUILD_ID=$bid"
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
+            echo "SOURCE_SHA=$(inp source_sha)"
           } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: codeman9528/QuasarAPP
           ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+          # Empty → default branch (checkout's own fallback), so a manual
+          # dispatch without source_sha behaves exactly as it used to.
+          ref: ${{ env.SOURCE_SHA }}
 
       # Builds float to main HEAD (no per-build ref pin), so record the exact
       # commit that produced this artifact — provenance + reproducibility.
@@ -208,12 +224,12 @@ jobs:
       # this action installs, so a lower pin here silently builds with the
       # newer toolchain — and any `targets:` added below would land on the
       # wrong one (Android std missing → "can't find crate for `std`").
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-      # No version here — pnpm/action-setup@v4 errors if a version is set both
+      - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # No version here — pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4 errors if a version is set both
       # here AND via package.json's packageManager (pnpm@9.12.0). Let it read that.
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 20, cache: pnpm }
 
       - name: Install Tauri CLI
@@ -471,12 +487,16 @@ jobs:
             echo "BUILD_ID=$bid"
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
+            echo "SOURCE_SHA=$(inp source_sha)"
           } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: codeman9528/QuasarAPP
           ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+          # Empty → default branch (checkout's own fallback), so a manual
+          # dispatch without source_sha behaves exactly as it used to.
+          ref: ${{ env.SOURCE_SHA }}
 
       - name: Mask brand identity in logs
         shell: bash
@@ -493,11 +513,11 @@ jobs:
                 host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
                 [ -n "$host" ] && echo "::add-mask::$host"
               done || true
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with: { distribution: temurin, java-version: "17" }
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         # The action's default is "tools platform-tools"; Google removed the
         # legacy `tools` package from the SDK repository, so sdkmanager exits 1
         # ("Failed to find package 'tools'") and the job dies here. Nothing in
@@ -519,15 +539,15 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
       # Go is needed for the gomobile AAR (the embedded sing-box core).
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: "1.23" }
 
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
-      - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 20, cache: pnpm }
 
       - name: Install Tauri CLI
@@ -705,12 +725,16 @@ jobs:
             echo "BUILD_ID=$bid"
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
+            echo "SOURCE_SHA=$(inp source_sha)"
           } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: codeman9528/QuasarAPP
           ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+          # Empty → default branch (checkout's own fallback), so a manual
+          # dispatch without source_sha behaves exactly as it used to.
+          ref: ${{ env.SOURCE_SHA }}
 
       # Rust is needed only to build+run quasar-publish (small, and rust-cache'd).
       - name: Mask brand identity in logs
@@ -728,8 +752,8 @@ jobs:
                 host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
                 [ -n "$host" ] && echo "::add-mask::$host"
               done || true
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Pull staged artifacts from R2
         shell: bash
@@ -749,11 +773,11 @@ jobs:
 
       - name: Set up JDK for apksigner
         if: steps.apk.outputs.found == 'true'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with: { distribution: temurin, java-version: "17" }
       - name: Set up Android build-tools (zipalign + apksigner)
         if: steps.apk.outputs.found == 'true'
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         # The action's default is "tools platform-tools"; Google removed the
         # legacy `tools` package from the SDK repository, so sdkmanager exits 1
         # ("Failed to find package 'tools'") and the job dies here. Nothing in
