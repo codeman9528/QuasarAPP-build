@@ -61,6 +61,11 @@ on:
       # code, and a rebuild of a shipped version was not reproducible.
       # Blank (an old dispatch, or a manual one) → the default branch, as before.
       source_sha: { description: "private-repo commit to build (blank = default branch HEAD)", required: false, default: "" }
+      # Which private source repo to compile: the standard client, or the 双 OSS
+      # fork (codeman9528/QuasarAPP-DualOSS). Each has its own read-only deploy
+      # key in this repo's secrets (a deploy key belongs to exactly one repo).
+      # Blank → the standard repo, as every dispatch before this input did.
+      source_repo: { description: "private source repo to build (blank = codeman9528/QuasarAPP)", required: false, default: "" }
 
 concurrency:
   group: build-${{ inputs.slug }}-${{ inputs.version }}
@@ -122,6 +127,7 @@ jobs:
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
             echo "SOURCE_SHA=$(inp source_sha)"
+            repo="$(inp source_repo)"; echo "SOURCE_REPO=${repo:-codeman9528/QuasarAPP}"
           } >> "$GITHUB_ENV"
       - name: Plan jobs from targets
         id: plan
@@ -180,12 +186,13 @@ jobs:
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
             echo "SOURCE_SHA=$(inp source_sha)"
+            repo="$(inp source_repo)"; echo "SOURCE_REPO=${repo:-codeman9528/QuasarAPP}"
           } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: codeman9528/QuasarAPP
-          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+          repository: ${{ env.SOURCE_REPO }}
+          ssh-key: ${{ env.SOURCE_REPO == 'codeman9528/QuasarAPP-DualOSS' && secrets.PRIVATE_REPO_DEPLOY_KEY_DUALOSS || secrets.PRIVATE_REPO_DEPLOY_KEY }}
           # Empty → default branch (checkout's own fallback), so a manual
           # dispatch without source_sha behaves exactly as it used to.
           ref: ${{ env.SOURCE_SHA }}
@@ -871,12 +878,13 @@ jobs:
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
             echo "SOURCE_SHA=$(inp source_sha)"
+            repo="$(inp source_repo)"; echo "SOURCE_REPO=${repo:-codeman9528/QuasarAPP}"
           } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: codeman9528/QuasarAPP
-          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+          repository: ${{ env.SOURCE_REPO }}
+          ssh-key: ${{ env.SOURCE_REPO == 'codeman9528/QuasarAPP-DualOSS' && secrets.PRIVATE_REPO_DEPLOY_KEY_DUALOSS || secrets.PRIVATE_REPO_DEPLOY_KEY }}
           # Empty → default branch (checkout's own fallback), so a manual
           # dispatch without source_sha behaves exactly as it used to.
           ref: ${{ env.SOURCE_SHA }}
@@ -1353,12 +1361,13 @@ jobs:
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
             echo "SOURCE_SHA=$(inp source_sha)"
+            repo="$(inp source_repo)"; echo "SOURCE_REPO=${repo:-codeman9528/QuasarAPP}"
           } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: codeman9528/QuasarAPP
-          ssh-key: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}
+          repository: ${{ env.SOURCE_REPO }}
+          ssh-key: ${{ env.SOURCE_REPO == 'codeman9528/QuasarAPP-DualOSS' && secrets.PRIVATE_REPO_DEPLOY_KEY_DUALOSS || secrets.PRIVATE_REPO_DEPLOY_KEY }}
           # Empty → default branch (checkout's own fallback), so a manual
           # dispatch without source_sha behaves exactly as it used to.
           ref: ${{ env.SOURCE_SHA }}
