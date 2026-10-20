@@ -501,6 +501,11 @@ jobs:
           [ "$got" = "$sum" ] || { echo "::error::sentry-cli $v checksum mismatch ($got)"; exit 1; }
           chmod +x "$exe"
           "$exe" --version
+          # The UI build (beforeBuildCommand → vite) runs `sentry-cli sourcemaps
+          # inject` only when SENTRY_CLI is set — and it runs BEFORE the upload
+          # step that used to export it, so no bundle ever got a debug id and
+          # Bugsink could resolve nothing. Path only; no token here.
+          echo "SENTRY_CLI=$exe" >> "$GITHUB_ENV"
           cp scripts/sentry-upload.sh "$tools/sentry-upload.sh"
           {
             echo "tools=$tools"
@@ -1229,6 +1234,11 @@ jobs:
           [ "$got" = "$sum" ] || { echo "::error::sentry-cli $v checksum mismatch ($got)"; exit 1; }
           chmod +x "$exe"
           "$exe" --version
+          # The UI build (beforeBuildCommand → vite) runs `sentry-cli sourcemaps
+          # inject` only when SENTRY_CLI is set — and it runs BEFORE the upload
+          # step that used to export it, so no bundle ever got a debug id and
+          # Bugsink could resolve nothing. Path only; no token here.
+          echo "SENTRY_CLI=$exe" >> "$GITHUB_ENV"
           cp scripts/sentry-upload.sh "$tools/sentry-upload.sh"
           {
             echo "tools=$tools"
