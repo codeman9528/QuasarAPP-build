@@ -114,6 +114,8 @@ jobs:
     steps:
       - name: Load inputs (masked)
         shell: bash
+        env:
+          DUALOSS_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY_DUALOSS }}
         run: |
           set -euo pipefail
           inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
@@ -127,7 +129,19 @@ jobs:
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
             echo "SOURCE_SHA=$(inp source_sha)"
-            repo="$(inp source_repo)"; echo "SOURCE_REPO=${repo:-codeman9528/QuasarAPP}"
+            # ALLOWLIST. This repo is public and workflow_dispatch-able, and the
+            # checked-out tree is executed here with the deploy keys, the staging
+            # credentials and the Android keystore in reach: an arbitrary
+            # `source_repo` would be arbitrary code on this runner.
+            repo="${repo:-}"; repo="$(inp source_repo)"; repo="${repo:-codeman9528/QuasarAPP}"
+            case "$repo" in
+              codeman9528/QuasarAPP|codeman9528/QuasarAPP-DualOSS) ;;
+              *) echo "::error::source_repo '$repo' is not an allowed source repo"; exit 1 ;;
+            esac
+            if [ "$repo" = codeman9528/QuasarAPP-DualOSS ] && [ -z "$DUALOSS_KEY" ]; then
+              echo "::error::PRIVATE_REPO_DEPLOY_KEY_DUALOSS secret is not set — cannot check out $repo"; exit 1
+            fi
+            echo "SOURCE_REPO=$repo"
           } >> "$GITHUB_ENV"
       - name: Plan jobs from targets
         id: plan
@@ -173,6 +187,8 @@ jobs:
     steps:
       - name: Load inputs (masked)
         shell: bash
+        env:
+          DUALOSS_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY_DUALOSS }}
         run: |
           set -euo pipefail
           inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
@@ -186,7 +202,19 @@ jobs:
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
             echo "SOURCE_SHA=$(inp source_sha)"
-            repo="$(inp source_repo)"; echo "SOURCE_REPO=${repo:-codeman9528/QuasarAPP}"
+            # ALLOWLIST. This repo is public and workflow_dispatch-able, and the
+            # checked-out tree is executed here with the deploy keys, the staging
+            # credentials and the Android keystore in reach: an arbitrary
+            # `source_repo` would be arbitrary code on this runner.
+            repo="${repo:-}"; repo="$(inp source_repo)"; repo="${repo:-codeman9528/QuasarAPP}"
+            case "$repo" in
+              codeman9528/QuasarAPP|codeman9528/QuasarAPP-DualOSS) ;;
+              *) echo "::error::source_repo '$repo' is not an allowed source repo"; exit 1 ;;
+            esac
+            if [ "$repo" = codeman9528/QuasarAPP-DualOSS ] && [ -z "$DUALOSS_KEY" ]; then
+              echo "::error::PRIVATE_REPO_DEPLOY_KEY_DUALOSS secret is not set — cannot check out $repo"; exit 1
+            fi
+            echo "SOURCE_REPO=$repo"
           } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -221,7 +249,7 @@ jobs:
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "· built v$VERSION ${{ matrix.arch }} from private@${sha:0:9}" \
+          echo "· built v$VERSION ${{ matrix.arch }} from ${SOURCE_REPO##*/}@${sha:0:9}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Linux build deps
@@ -865,6 +893,8 @@ jobs:
     steps:
       - name: Load inputs (masked)
         shell: bash
+        env:
+          DUALOSS_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY_DUALOSS }}
         run: |
           set -euo pipefail
           inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
@@ -878,7 +908,19 @@ jobs:
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
             echo "SOURCE_SHA=$(inp source_sha)"
-            repo="$(inp source_repo)"; echo "SOURCE_REPO=${repo:-codeman9528/QuasarAPP}"
+            # ALLOWLIST. This repo is public and workflow_dispatch-able, and the
+            # checked-out tree is executed here with the deploy keys, the staging
+            # credentials and the Android keystore in reach: an arbitrary
+            # `source_repo` would be arbitrary code on this runner.
+            repo="${repo:-}"; repo="$(inp source_repo)"; repo="${repo:-codeman9528/QuasarAPP}"
+            case "$repo" in
+              codeman9528/QuasarAPP|codeman9528/QuasarAPP-DualOSS) ;;
+              *) echo "::error::source_repo '$repo' is not an allowed source repo"; exit 1 ;;
+            esac
+            if [ "$repo" = codeman9528/QuasarAPP-DualOSS ] && [ -z "$DUALOSS_KEY" ]; then
+              echo "::error::PRIVATE_REPO_DEPLOY_KEY_DUALOSS secret is not set — cannot check out $repo"; exit 1
+            fi
+            echo "SOURCE_REPO=$repo"
           } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -1348,6 +1390,8 @@ jobs:
       # + the release-readme template.
       - name: Load inputs (masked)
         shell: bash
+        env:
+          DUALOSS_KEY: ${{ secrets.PRIVATE_REPO_DEPLOY_KEY_DUALOSS }}
         run: |
           set -euo pipefail
           inp() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
@@ -1361,7 +1405,19 @@ jobs:
             echo "QUASAR_BUILD_ID=$bid"
             echo "TARGETS=$(inp targets)"
             echo "SOURCE_SHA=$(inp source_sha)"
-            repo="$(inp source_repo)"; echo "SOURCE_REPO=${repo:-codeman9528/QuasarAPP}"
+            # ALLOWLIST. This repo is public and workflow_dispatch-able, and the
+            # checked-out tree is executed here with the deploy keys, the staging
+            # credentials and the Android keystore in reach: an arbitrary
+            # `source_repo` would be arbitrary code on this runner.
+            repo="${repo:-}"; repo="$(inp source_repo)"; repo="${repo:-codeman9528/QuasarAPP}"
+            case "$repo" in
+              codeman9528/QuasarAPP|codeman9528/QuasarAPP-DualOSS) ;;
+              *) echo "::error::source_repo '$repo' is not an allowed source repo"; exit 1 ;;
+            esac
+            if [ "$repo" = codeman9528/QuasarAPP-DualOSS ] && [ -z "$DUALOSS_KEY" ]; then
+              echo "::error::PRIVATE_REPO_DEPLOY_KEY_DUALOSS secret is not set — cannot check out $repo"; exit 1
+            fi
+            echo "SOURCE_REPO=$repo"
           } >> "$GITHUB_ENV"
       - name: Checkout PRIVATE source (read-only deploy key)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
