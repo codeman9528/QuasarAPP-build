@@ -249,8 +249,10 @@ jobs:
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "· built v$VERSION ${{ matrix.arch }} from ${SOURCE_REPO##*/}@${sha:0:9}" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          # The summary is public and unmasked: no version, no source repo there
+          # (which repo a brand builds from is not for the farm's visitors).
+          echo "· built v$VERSION ${{ matrix.arch }} from ${SOURCE_REPO##*/}@${sha:0:9}"
+          echo "· built ${{ matrix.arch }} @${sha:0:9}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Linux build deps
         if: startsWith(matrix.os, 'ubuntu-')
@@ -626,7 +628,11 @@ jobs:
                 export CARGO_PROFILE_RELEASE_STRIP=none
                 export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--build-id=sha1"
                 conf="$QUASAR_DEBUG_FILES_DIR/../tauri-split-debug.json"
-                SPLIT_CMD="bash $GITHUB_WORKSPACE/scripts/split-debug.sh linux $GITHUB_WORKSPACE/target/release/quasar-app $QUASAR_DEBUG_FILES_DIR" \
+                # tauri renames the binary to mainBinaryName (the brand slug,
+                # set by "Apply brand") BEFORE beforeBundleCommand runs — the
+                # cargo name `quasar-app` no longer exists at that point.
+                bin="$(python3 -c "import json;print(json.load(open('crates/tauri-app/tauri.conf.json')).get('mainBinaryName') or 'quasar-app')")"
+                SPLIT_CMD="bash $GITHUB_WORKSPACE/scripts/split-debug.sh linux $GITHUB_WORKSPACE/target/release/$bin $QUASAR_DEBUG_FILES_DIR" \
                   python3 -c 'import json,os,sys; json.dump({"build":{"beforeBundleCommand":os.environ["SPLIT_CMD"]}}, open(sys.argv[1],"w"))' "$conf"
                 ;;
             esac
@@ -707,7 +713,9 @@ jobs:
                      target/aarch64-apple-darwin/release/quasar-helper.dSYM \
                      target/x86_64-apple-darwin/release/quasar-helper.dSYM ;;
             windows-*)
-              set -- target/release/quasar-app.exe target/release/quasar_app.pdb \
+              # The .exe was renamed to mainBinaryName; the .pdb keeps cargo's name.
+              bin="$(python3 -c "import json;print(json.load(open('crates/tauri-app/tauri.conf.json')).get('mainBinaryName') or 'quasar-app')")"
+              set -- "target/release/$bin.exe" target/release/quasar_app.pdb \
                      target/release/quasar-helper.exe target/release/quasar_helper.pdb ;;
             linux-*)
               # quasar-app.debug + quasar-helper.debug
