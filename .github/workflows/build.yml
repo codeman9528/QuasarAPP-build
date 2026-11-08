@@ -246,7 +246,7 @@ jobs:
           # .cargo/config.toml or brand.yaml would put them in this PUBLIC log.
           # oss_enc_key also in its derived forms: without the base64 `=` padding,
           # and decoded as hex. Plain python3 (no PyYAML): present on all runners.
-          python3 - "$f" <<'PY' || true
+          python3 - "$f" <<'PY' || echo "::warning::brand mask step failed"
           import base64, re, sys
           SCALARS = {"name", "identifier", "window_title", "panel_base", "update_base_url",
                      "public_url_base", "oss_enc_key", "invite_code", "signup_url", "adblock_url",
@@ -261,8 +261,11 @@ jobs:
               if m:
                   k, rest = m.group(1), m.group(2)
                   cur = k if (k in LISTS and not rest.strip()) else None
-                  if k in LISTS and rest.strip().startswith("["):
-                      vals += [unq(x) for x in rest.strip().strip("[]").split(",")]
+                  # A trailing comment goes first: `[a, b]  # x` otherwise
+                  # left `b"]` as the last item.
+                  flow = re.sub(r"\s+#.*$", "", rest).strip()
+                  if k in LISTS and flow.startswith("["):
+                      vals += [unq(x) for x in flow.strip("[]").split(",")]
                   elif k in SCALARS:
                       vals.append(unq(rest))
                       if k == "oss_enc_key": key_vals.append(unq(rest))
@@ -277,13 +280,19 @@ jobs:
               vals.append(k.rstrip("="))
               try: vals.append(base64.b64decode(k + "=" * (-len(k) % 4)).hex())
               except Exception: pass
+          # YAML literals and very short values are never secrets, and masking
+          # them (`::add-mask::null`) would star out every `null` in the log.
+          LITERALS = {"null", "~", "true", "false", "yes", "no", "on", "off"}
+          def maskable(v):
+              return len(v) >= 4 and not v.startswith("${") and v.lower() not in LITERALS
           out = set()
           for v in vals:
-              if len(v) < 2 or v.startswith("${"): continue
+              if not maskable(v): continue
               out.add(v)
               h = re.match(r"^[a-z]+://([^/:]+)", v)
               if h: out.add(h.group(1))
               elif "." in v and "/" not in v and " " not in v: out.add(v.lstrip("."))
+          out = {v for v in out if maskable(v)}
           for v in sorted(out, key=len, reverse=True):
               print(f"::add-mask::{v}")
           PY
@@ -1009,7 +1018,7 @@ jobs:
           # .cargo/config.toml or brand.yaml would put them in this PUBLIC log.
           # oss_enc_key also in its derived forms: without the base64 `=` padding,
           # and decoded as hex. Plain python3 (no PyYAML): present on all runners.
-          python3 - "$f" <<'PY' || true
+          python3 - "$f" <<'PY' || echo "::warning::brand mask step failed"
           import base64, re, sys
           SCALARS = {"name", "identifier", "window_title", "panel_base", "update_base_url",
                      "public_url_base", "oss_enc_key", "invite_code", "signup_url", "adblock_url",
@@ -1024,8 +1033,11 @@ jobs:
               if m:
                   k, rest = m.group(1), m.group(2)
                   cur = k if (k in LISTS and not rest.strip()) else None
-                  if k in LISTS and rest.strip().startswith("["):
-                      vals += [unq(x) for x in rest.strip().strip("[]").split(",")]
+                  # A trailing comment goes first: `[a, b]  # x` otherwise
+                  # left `b"]` as the last item.
+                  flow = re.sub(r"\s+#.*$", "", rest).strip()
+                  if k in LISTS and flow.startswith("["):
+                      vals += [unq(x) for x in flow.strip("[]").split(",")]
                   elif k in SCALARS:
                       vals.append(unq(rest))
                       if k == "oss_enc_key": key_vals.append(unq(rest))
@@ -1040,13 +1052,19 @@ jobs:
               vals.append(k.rstrip("="))
               try: vals.append(base64.b64decode(k + "=" * (-len(k) % 4)).hex())
               except Exception: pass
+          # YAML literals and very short values are never secrets, and masking
+          # them (`::add-mask::null`) would star out every `null` in the log.
+          LITERALS = {"null", "~", "true", "false", "yes", "no", "on", "off"}
+          def maskable(v):
+              return len(v) >= 4 and not v.startswith("${") and v.lower() not in LITERALS
           out = set()
           for v in vals:
-              if len(v) < 2 or v.startswith("${"): continue
+              if not maskable(v): continue
               out.add(v)
               h = re.match(r"^[a-z]+://([^/:]+)", v)
               if h: out.add(h.group(1))
               elif "." in v and "/" not in v and " " not in v: out.add(v.lstrip("."))
+          out = {v for v in out if maskable(v)}
           for v in sorted(out, key=len, reverse=True):
               print(f"::add-mask::{v}")
           PY
@@ -1558,7 +1576,7 @@ jobs:
           # .cargo/config.toml or brand.yaml would put them in this PUBLIC log.
           # oss_enc_key also in its derived forms: without the base64 `=` padding,
           # and decoded as hex. Plain python3 (no PyYAML): present on all runners.
-          python3 - "$f" <<'PY' || true
+          python3 - "$f" <<'PY' || echo "::warning::brand mask step failed"
           import base64, re, sys
           SCALARS = {"name", "identifier", "window_title", "panel_base", "update_base_url",
                      "public_url_base", "oss_enc_key", "invite_code", "signup_url", "adblock_url",
@@ -1573,8 +1591,11 @@ jobs:
               if m:
                   k, rest = m.group(1), m.group(2)
                   cur = k if (k in LISTS and not rest.strip()) else None
-                  if k in LISTS and rest.strip().startswith("["):
-                      vals += [unq(x) for x in rest.strip().strip("[]").split(",")]
+                  # A trailing comment goes first: `[a, b]  # x` otherwise
+                  # left `b"]` as the last item.
+                  flow = re.sub(r"\s+#.*$", "", rest).strip()
+                  if k in LISTS and flow.startswith("["):
+                      vals += [unq(x) for x in flow.strip("[]").split(",")]
                   elif k in SCALARS:
                       vals.append(unq(rest))
                       if k == "oss_enc_key": key_vals.append(unq(rest))
@@ -1589,13 +1610,19 @@ jobs:
               vals.append(k.rstrip("="))
               try: vals.append(base64.b64decode(k + "=" * (-len(k) % 4)).hex())
               except Exception: pass
+          # YAML literals and very short values are never secrets, and masking
+          # them (`::add-mask::null`) would star out every `null` in the log.
+          LITERALS = {"null", "~", "true", "false", "yes", "no", "on", "off"}
+          def maskable(v):
+              return len(v) >= 4 and not v.startswith("${") and v.lower() not in LITERALS
           out = set()
           for v in vals:
-              if len(v) < 2 or v.startswith("${"): continue
+              if not maskable(v): continue
               out.add(v)
               h = re.match(r"^[a-z]+://([^/:]+)", v)
               if h: out.add(h.group(1))
               elif "." in v and "/" not in v and " " not in v: out.add(v.lstrip("."))
+          out = {v for v in out if maskable(v)}
           for v in sorted(out, key=len, reverse=True):
               print(f"::add-mask::{v}")
           PY
