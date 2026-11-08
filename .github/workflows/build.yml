@@ -224,6 +224,10 @@ jobs:
           # Empty → default branch (checkout's own fallback), so a manual
           # dispatch without source_sha behaves exactly as it used to.
           ref: ${{ env.SOURCE_SHA }}
+          # Drop the deploy key once the tree is here: every later step runs the
+          # source's build scripts (cargo build.rs, npm, gradle), and none of
+          # them needs to fetch from the private repo again.
+          persist-credentials: false
 
       # Builds float to main HEAD (no per-build ref pin), so record the exact
       # commit that produced this artifact — provenance + reproducibility.
@@ -233,15 +237,56 @@ jobs:
           set -euo pipefail
           f="brands/$SLUG/brand.yaml"
           [ -f "$f" ] || exit 0
-          # name / identifier / window_title / the brand's own hosts: all of it
-          # identifies the customer, and builder + tauri print them.
-          grep -E '^[[:space:]]*(name|identifier|window_title|panel_base|update_base_url|public_url_base):' "$f" \
-            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
-            | while IFS= read -r v; do
-                [ ${#v} -ge 2 ] && echo "::add-mask::$v"
-                host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
-                [ -n "$host" ] && echo "::add-mask::$host"
-              done || true
+          # Everything in brand.yaml that identifies the customer or is secret-ish:
+          # name / identifier / window_title / the brand's own hosts (builder +
+          # tauri print them), the config key, invite code, signup / adblock /
+          # support links, OSS credentials, and every config mirror and allowlist
+          # domain (YAML lists, flow `[a, b]` or block `- a`). Each value is masked
+          # with its host. Nothing prints them today, but a later `-v`, a dumped
+          # .cargo/config.toml or brand.yaml would put them in this PUBLIC log.
+          # oss_enc_key also in its derived forms: without the base64 `=` padding,
+          # and decoded as hex. Plain python3 (no PyYAML): present on all runners.
+          python3 - "$f" <<'PY' || true
+          import base64, re, sys
+          SCALARS = {"name", "identifier", "window_title", "panel_base", "update_base_url",
+                     "public_url_base", "oss_enc_key", "invite_code", "signup_url", "adblock_url",
+                     "support_url", "endpoint", "bucket", "access_key_id", "secret_access_key"}
+          LISTS = {"endpoint_allowlist", "fetch_mirrors"}
+          def unq(v):
+              v = re.sub(r"\s+#.*$", "", v.strip()).strip()
+              return v[1:-1] if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v
+          vals, key_vals, cur = [], [], None
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              m = re.match(r"^\s*([A-Za-z_]+):\s*(.*)$", line)
+              if m:
+                  k, rest = m.group(1), m.group(2)
+                  cur = k if (k in LISTS and not rest.strip()) else None
+                  if k in LISTS and rest.strip().startswith("["):
+                      vals += [unq(x) for x in rest.strip().strip("[]").split(",")]
+                  elif k in SCALARS:
+                      vals.append(unq(rest))
+                      if k == "oss_enc_key": key_vals.append(unq(rest))
+                  continue
+              b = re.match(r"^\s*-\s*(.+)$", line)
+              if cur and b:
+                  vals.append(unq(b.group(1)))
+              elif line.strip() and not line.lstrip().startswith("#"):
+                  cur = None
+          for k in key_vals:
+              if not k: continue
+              vals.append(k.rstrip("="))
+              try: vals.append(base64.b64decode(k + "=" * (-len(k) % 4)).hex())
+              except Exception: pass
+          out = set()
+          for v in vals:
+              if len(v) < 2 or v.startswith("${"): continue
+              out.add(v)
+              h = re.match(r"^[a-z]+://([^/:]+)", v)
+              if h: out.add(h.group(1))
+              elif "." in v and "/" not in v and " " not in v: out.add(v.lstrip("."))
+          for v in sorted(out, key=len, reverse=True):
+              print(f"::add-mask::{v}")
+          PY
       - name: Record source commit
         id: src
         shell: bash
@@ -332,7 +377,8 @@ jobs:
             | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\.*//' \
             | grep -c . || true)"
           if [ "${n:-0}" -eq 0 ]; then
-            echo "::error::QUASAR_ENDPOINT_ALLOWLIST has no usable domain (raw: '$v') — this client would post credentials to ANY host its remote config names. Re-save the brand in the console so brand.yaml carries client.endpoint_allowlist."
+            # Length only: the raw value names the customer's domains (public log).
+            echo "::error::QUASAR_ENDPOINT_ALLOWLIST has no usable domain (${#v} characters, 0 entries) — this client would post credentials to ANY host its remote config names. Re-save the brand in the console so brand.yaml carries client.endpoint_allowlist."
             exit 1
           fi
           echo "endpoint allowlist: $n domain(s)"
@@ -943,6 +989,10 @@ jobs:
           # Empty → default branch (checkout's own fallback), so a manual
           # dispatch without source_sha behaves exactly as it used to.
           ref: ${{ env.SOURCE_SHA }}
+          # Drop the deploy key once the tree is here: every later step runs the
+          # source's build scripts (cargo build.rs, npm, gradle), and none of
+          # them needs to fetch from the private repo again.
+          persist-credentials: false
 
       - name: Mask brand identity in logs
         shell: bash
@@ -950,15 +1000,56 @@ jobs:
           set -euo pipefail
           f="brands/$SLUG/brand.yaml"
           [ -f "$f" ] || exit 0
-          # name / identifier / window_title / the brand's own hosts: all of it
-          # identifies the customer, and builder + tauri print them.
-          grep -E '^[[:space:]]*(name|identifier|window_title|panel_base|update_base_url|public_url_base):' "$f" \
-            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
-            | while IFS= read -r v; do
-                [ ${#v} -ge 2 ] && echo "::add-mask::$v"
-                host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
-                [ -n "$host" ] && echo "::add-mask::$host"
-              done || true
+          # Everything in brand.yaml that identifies the customer or is secret-ish:
+          # name / identifier / window_title / the brand's own hosts (builder +
+          # tauri print them), the config key, invite code, signup / adblock /
+          # support links, OSS credentials, and every config mirror and allowlist
+          # domain (YAML lists, flow `[a, b]` or block `- a`). Each value is masked
+          # with its host. Nothing prints them today, but a later `-v`, a dumped
+          # .cargo/config.toml or brand.yaml would put them in this PUBLIC log.
+          # oss_enc_key also in its derived forms: without the base64 `=` padding,
+          # and decoded as hex. Plain python3 (no PyYAML): present on all runners.
+          python3 - "$f" <<'PY' || true
+          import base64, re, sys
+          SCALARS = {"name", "identifier", "window_title", "panel_base", "update_base_url",
+                     "public_url_base", "oss_enc_key", "invite_code", "signup_url", "adblock_url",
+                     "support_url", "endpoint", "bucket", "access_key_id", "secret_access_key"}
+          LISTS = {"endpoint_allowlist", "fetch_mirrors"}
+          def unq(v):
+              v = re.sub(r"\s+#.*$", "", v.strip()).strip()
+              return v[1:-1] if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v
+          vals, key_vals, cur = [], [], None
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              m = re.match(r"^\s*([A-Za-z_]+):\s*(.*)$", line)
+              if m:
+                  k, rest = m.group(1), m.group(2)
+                  cur = k if (k in LISTS and not rest.strip()) else None
+                  if k in LISTS and rest.strip().startswith("["):
+                      vals += [unq(x) for x in rest.strip().strip("[]").split(",")]
+                  elif k in SCALARS:
+                      vals.append(unq(rest))
+                      if k == "oss_enc_key": key_vals.append(unq(rest))
+                  continue
+              b = re.match(r"^\s*-\s*(.+)$", line)
+              if cur and b:
+                  vals.append(unq(b.group(1)))
+              elif line.strip() and not line.lstrip().startswith("#"):
+                  cur = None
+          for k in key_vals:
+              if not k: continue
+              vals.append(k.rstrip("="))
+              try: vals.append(base64.b64decode(k + "=" * (-len(k) % 4)).hex())
+              except Exception: pass
+          out = set()
+          for v in vals:
+              if len(v) < 2 or v.startswith("${"): continue
+              out.add(v)
+              h = re.match(r"^[a-z]+://([^/:]+)", v)
+              if h: out.add(h.group(1))
+              elif "." in v and "/" not in v and " " not in v: out.add(v.lstrip("."))
+          for v in sorted(out, key=len, reverse=True):
+              print(f"::add-mask::{v}")
+          PY
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with: { distribution: temurin, java-version: "17" }
 
@@ -1039,7 +1130,8 @@ jobs:
             | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\.*//' \
             | grep -c . || true)"
           if [ "${n:-0}" -eq 0 ]; then
-            echo "::error::QUASAR_ENDPOINT_ALLOWLIST has no usable domain (raw: '$v') — this client would post credentials to ANY host its remote config names. Re-save the brand in the console so brand.yaml carries client.endpoint_allowlist."
+            # Length only: the raw value names the customer's domains (public log).
+            echo "::error::QUASAR_ENDPOINT_ALLOWLIST has no usable domain (${#v} characters, 0 entries) — this client would post credentials to ANY host its remote config names. Re-save the brand in the console so brand.yaml carries client.endpoint_allowlist."
             exit 1
           fi
           echo "endpoint allowlist: $n domain(s)"
@@ -1445,6 +1537,10 @@ jobs:
           # Empty → default branch (checkout's own fallback), so a manual
           # dispatch without source_sha behaves exactly as it used to.
           ref: ${{ env.SOURCE_SHA }}
+          # Drop the deploy key once the tree is here: every later step runs the
+          # source's build scripts (cargo build.rs, npm, gradle), and none of
+          # them needs to fetch from the private repo again.
+          persist-credentials: false
 
       # Rust is needed only to build+run quasar-publish (small, and rust-cache'd).
       - name: Mask brand identity in logs
@@ -1453,15 +1549,56 @@ jobs:
           set -euo pipefail
           f="brands/$SLUG/brand.yaml"
           [ -f "$f" ] || exit 0
-          # name / identifier / window_title / the brand's own hosts: all of it
-          # identifies the customer, and builder + tauri print them.
-          grep -E '^[[:space:]]*(name|identifier|window_title|panel_base|update_base_url|public_url_base):' "$f" \
-            | sed -E 's/^[^:]*:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/' \
-            | while IFS= read -r v; do
-                [ ${#v} -ge 2 ] && echo "::add-mask::$v"
-                host="$(printf '%s' "$v" | sed -nE 's#^https?://([^/:]+).*#\1#p')"
-                [ -n "$host" ] && echo "::add-mask::$host"
-              done || true
+          # Everything in brand.yaml that identifies the customer or is secret-ish:
+          # name / identifier / window_title / the brand's own hosts (builder +
+          # tauri print them), the config key, invite code, signup / adblock /
+          # support links, OSS credentials, and every config mirror and allowlist
+          # domain (YAML lists, flow `[a, b]` or block `- a`). Each value is masked
+          # with its host. Nothing prints them today, but a later `-v`, a dumped
+          # .cargo/config.toml or brand.yaml would put them in this PUBLIC log.
+          # oss_enc_key also in its derived forms: without the base64 `=` padding,
+          # and decoded as hex. Plain python3 (no PyYAML): present on all runners.
+          python3 - "$f" <<'PY' || true
+          import base64, re, sys
+          SCALARS = {"name", "identifier", "window_title", "panel_base", "update_base_url",
+                     "public_url_base", "oss_enc_key", "invite_code", "signup_url", "adblock_url",
+                     "support_url", "endpoint", "bucket", "access_key_id", "secret_access_key"}
+          LISTS = {"endpoint_allowlist", "fetch_mirrors"}
+          def unq(v):
+              v = re.sub(r"\s+#.*$", "", v.strip()).strip()
+              return v[1:-1] if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v
+          vals, key_vals, cur = [], [], None
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              m = re.match(r"^\s*([A-Za-z_]+):\s*(.*)$", line)
+              if m:
+                  k, rest = m.group(1), m.group(2)
+                  cur = k if (k in LISTS and not rest.strip()) else None
+                  if k in LISTS and rest.strip().startswith("["):
+                      vals += [unq(x) for x in rest.strip().strip("[]").split(",")]
+                  elif k in SCALARS:
+                      vals.append(unq(rest))
+                      if k == "oss_enc_key": key_vals.append(unq(rest))
+                  continue
+              b = re.match(r"^\s*-\s*(.+)$", line)
+              if cur and b:
+                  vals.append(unq(b.group(1)))
+              elif line.strip() and not line.lstrip().startswith("#"):
+                  cur = None
+          for k in key_vals:
+              if not k: continue
+              vals.append(k.rstrip("="))
+              try: vals.append(base64.b64decode(k + "=" * (-len(k) % 4)).hex())
+              except Exception: pass
+          out = set()
+          for v in vals:
+              if len(v) < 2 or v.startswith("${"): continue
+              out.add(v)
+              h = re.match(r"^[a-z]+://([^/:]+)", v)
+              if h: out.add(h.group(1))
+              elif "." in v and "/" not in v and " " not in v: out.add(v.lstrip("."))
+          for v in sorted(out, key=len, reverse=True):
+              print(f"::add-mask::{v}")
+          PY
       - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with: { prefix-key: "v1-quasar-farm" }   # bump with the other two
