@@ -156,7 +156,7 @@ jobs:
             t="$(echo "$t" | xargs)"   # trim whitespace
             case "$t" in
               windows) matrix=$(jq -c '. + [{"os":"windows-latest","arch":"windows-x86_64"}]' <<<"$matrix") ;;
-              macos)   matrix=$(jq -c '. + [{"os":"macos-14","arch":"darwin-universal"}]' <<<"$matrix") ;;  # universal = arm64 + x86_64 fat binary, one pkg for every Mac
+              macos)   matrix=$(jq -c '. + [{"os":"macos-15","arch":"darwin-universal"}]' <<<"$matrix") ;;  # universal = arm64 + x86_64 fat binary, one pkg for every Mac
               # ubuntu-22.04, NOT ubuntu-latest: the runner's glibc becomes the
               # binary's minimum, and `latest` moves under us (24.04 = glibc 2.39,
               # which will not run on Ubuntu 22.04 LTS or Debian 12 — both still
