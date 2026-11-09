@@ -1763,11 +1763,6 @@ jobs:
               t = t.replace(f"__{k}__", os.environ.get(k, ""))
           open(sys.argv[2], "w", encoding="utf-8").write(t)
           PYEOF
-          # GPLv3 §6 expects the notices to travel WITH the binaries, and the
-          # operator — not us — is the one distributing them, so the file has to
-          # be in the zip they receive. The client also carries an offline copy
-          # (设置 → 关于 → 开源许可) for the end user.
-          cp THIRD-PARTY-NOTICES.md "release-bundle/THIRD-PARTY-NOTICES.md"
           # Build provenance — appended to the BOTTOM of 发布说明.txt. build_id is
           # unique per console build and is ALSO baked into the binary (设置→关于
           # shows the same #id + time), so a stale same-version zip is caught by
