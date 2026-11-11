@@ -758,7 +758,7 @@ jobs:
           [ "$(sha "$run/sentry-cli$ext")" = "$CLI_SHA256" ] || { echo "::error::sentry-cli changed after the gate verified it"; exit 1; }
           [ "$(sha "$run/sentry-upload.sh")" = "$UPLOAD_SHA256" ] || { echo "::error::sentry-upload.sh changed after the gate copied it"; exit 1; }
           export SENTRY_CLI="$run/sentry-cli$ext"
-          export QUASAR_SENTRY_SOURCE_ROOT="$GITHUB_WORKSPACE"
+          export QUASAR_BUGSINK_SOURCE_ROOT="$GITHUB_WORKSPACE"
           up() { bash "$run/sentry-upload.sh" "$@"; }
           echo "· sentry release: $(up release)"
           case "${{ matrix.arch }}" in
@@ -1438,7 +1438,7 @@ jobs:
           [ "$(sha "$run/sentry-cli$ext")" = "$CLI_SHA256" ] || { echo "::error::sentry-cli changed after the gate verified it"; exit 1; }
           [ "$(sha "$run/sentry-upload.sh")" = "$UPLOAD_SHA256" ] || { echo "::error::sentry-upload.sh changed after the gate copied it"; exit 1; }
           export SENTRY_CLI="$run/sentry-cli$ext"
-          export QUASAR_SENTRY_SOURCE_ROOT="$GITHUB_WORKSPACE"
+          export QUASAR_BUGSINK_SOURCE_ROOT="$GITHUB_WORKSPACE"
           up() { bash "$run/sentry-upload.sh" "$@"; }
           echo "· sentry release: $(up release)"
           up debug-files \
